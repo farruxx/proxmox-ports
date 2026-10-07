@@ -96,10 +96,9 @@ await shot("wildcard", { hash: "#domains", height: 820, setup: `
   openWcDlg(null); const f = document.querySelector('#wcForm');
   f.zone.value = 'example.com'; f.zone.dispatchEvent(new Event('input'));
   document.querySelector('#wcFields input').value = 'x'.repeat(40); document.activeElement.blur();` });
-await shot("debug", { hash: "#debug", dark: true, height: 900, setup: `
+await shot("debug", { hash: "#debug", height: 900, setup: `
   ${waitFor("document.querySelectorAll('#checks li').length > 3")}
   ${CLEAN}
   for (const d of document.querySelectorAll('details.sec')) d.open = false;` });
-await shot("mobile", { hash: "#domains", dark: true, width: 390, height: 844, mobile: true, fit: true });
 
 ws.close(); chrome.kill();
