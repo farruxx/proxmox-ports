@@ -57,7 +57,16 @@ SAMPLE_DOMAINS = [
     {"domain": "cloud.example.com", "ip": "10.10.10.13", "port": 80, "tls": "letsencrypt", "max_body": "10g"},  # cert ok
     {"domain": "app.example.com", "aliases": "www.app.example.com", "ip": "10.10.10.10", "port": 80, "tls": "none"},
     {"domain": "broken.invalid", "ip": "10.10.10.11", "port": 8080, "tls": "letsencrypt"},  # no DNS, nothing on 8080
+    {"domain": "status.example.com", "ip": "10.10.10.10", "port": 80, "tls": "wildcard"},  # uses *.example.com
 ]
+
+# wildcard certificates seeded into a fresh ./.dev config (token "bad" makes the mock DNS API reject it)
+SAMPLE_WILDCARDS = [
+    {"zone": "example.com", "provider": "cloudflare", "credentials": {"dns_cloudflare_api_token": "mock-token"}},
+]
+
+# certbot DNS plugins "installed" on the mock host (others report as missing)
+DNS_PLUGINS = ["dns-cloudflare", "dns-digitalocean", "dns-rfc2136"]
 
 TARGETS = {"ACCEPT", "DROP", "REJECT", "RETURN", "DNAT", "SNAT", "MASQUERADE", "LOG"}
 
@@ -95,7 +104,8 @@ def default_state():
         "counters": {},  # "table|chain|rule" -> [packets, bytes]
         "nginx_active": True,
         "nginx_test_fail": False,
-        "issued": {"cloud.example.com": {"names": ["cloud.example.com"], "expires": time.time() + 61 * 86400}},
+        "issued": {"cloud.example.com": {"names": ["cloud.example.com"], "expires": time.time() + 61 * 86400},
+                   "wildcard.example.com": {"names": ["example.com", "*.example.com"], "expires": time.time() + 75 * 86400}},
     }
 
 
@@ -149,6 +159,9 @@ class Mock:
     def path_for(self, real_path):
         """Map a real host path (e.g. /etc/nginx/conf.d/x.conf) into the mock filesystem under .dev."""
         return os.path.join(self.root, real_path.lstrip("/"))
+
+    def sample_wildcards(self):
+        return [dict(w) for w in SAMPLE_WILDCARDS]
 
     def sample_domains(self):
         return [dict(d) for d in SAMPLE_DOMAINS]
@@ -455,6 +468,29 @@ class Mock:
                        "nginx: configuration file /etc/nginx/nginx.conf test is successful"), False
         return 1, "(mock) unsupported nginx call", False
 
+    def _dns01(self, a, names):
+        """Simulate certbot's DNS plugin talking to the provider API. Returns error text or None."""
+        auth = a[a.index("--authenticator") + 1]
+        if auth not in DNS_PLUGINS:
+            return "Could not choose appropriate plugin: The requested %s plugin does not appear to be installed" % auth
+        cred = a[a.index("--%s-credentials" % auth) + 1]
+        try:
+            with open(cred) as f:
+                text = f.read()
+        except OSError:
+            return "Error: File not found: %s" % cred
+        if re.search(r"=\s*bad\s*$", text, re.M):
+            return ("Encountered exception during recovery: certbot.errors.PluginError: Error determining zone_id: "
+                    "6003 Invalid request headers. Please confirm that you have supplied valid Cloudflare API credentials. "
+                    "(Did you copy your entire API token/key? To use Cloudflare tokens, you'll need the python package "
+                    "cloudflare>=2.3.1. This certbot is running cloudflare 2.11.1)")
+        zone = names[0]
+        if zone.endswith(".invalid"):
+            return ("Encountered exception during recovery: certbot.errors.PluginError: Unable to determine zone identifier "
+                    "for %s using zone names: ['%s', 'invalid']" % (zone, zone))
+        time.sleep(1)  # "Waiting 10 seconds for DNS changes to propagate"
+        return None
+
     def c_systemctl(self, st, a, data):
         if a[-1] != "nginx":
             return 1, "(mock) only nginx is simulated", False
@@ -491,10 +527,19 @@ class Mock:
                         "    Expiry Date: %s (VALID: %d days)" % (time.strftime("%Y-%m-%d %H:%M:%S+00:00", time.gmtime(c["expires"])), days),
                         "    Certificate Path: /etc/letsencrypt/live/%s/fullchain.pem" % name]
             return 0, "\n".join(out), False
+        if a[:1] == ["plugins"]:
+            out = ["Saving debug log to /var/log/letsencrypt/letsencrypt.log", "- " * 40]
+            for p in ["standalone", "webroot"] + DNS_PLUGINS:
+                out += ["* " + p, "Description: (mock)", "Interfaces: Authenticator, Plugin", "- " * 40]
+            return 0, "\n".join(out), False
         if a[:1] != ["certonly"]:
             return 1, "(mock) unsupported certbot call", False
         names = [a[i + 1] for i, x in enumerate(a) if x == "-d"]
         name = a[a.index("--cert-name") + 1]
+        if "--authenticator" in a:
+            err = self._dns01(a, names)
+            if err:
+                return 1, err, False
         time.sleep(2)  # ACME round trips take a moment
         bad = [n for n in names if self.resolve(n) == []]
         if bad:

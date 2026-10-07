@@ -63,6 +63,7 @@ DEFAULTS = {
     "rules": [],
     # Domains: nginx reverse proxy (+ optional Let's Encrypt via certbot).
     "domains": [],
+    "wildcards": [],  # wildcard certificates via DNS-01 (credentials in <config dir>/dns/<id>.ini)
     "acme_email": "",
     "nginx_conf": "/etc/nginx/conf.d/pve-portfwd.conf",
     "acme_webroot": "/var/lib/pve-portfwd/acme",
@@ -105,6 +106,13 @@ def load_config():
         except (ApiError, ValueError) as e:
             log("skipping invalid rule %r: %s" % (r.get("name") or r.get("id"), e), "warn")
     cfg["rules"] = rules
+    wildcards = []
+    for w in cfg.get("wildcards", []):
+        try:
+            wildcards.append(validate_wildcard(w, wildcards, w.get("id")))
+        except (ApiError, ValueError) as e:
+            log("skipping invalid wildcard %r: %s" % (w.get("zone") or w.get("id"), e), "warn")
+    cfg["wildcards"] = wildcards
     domains = []
     for d in cfg.get("domains", []):
         try:
@@ -504,8 +512,8 @@ def validate_domain(data, others, cfg, did=None, check_rules=True):
         raise ApiError("target port out of range")
     d["upstream_https"] = bool(data.get("upstream_https", False))
     d["tls"] = str(data.get("tls", "none"))
-    if d["tls"] not in ("none", "letsencrypt"):
-        raise ApiError("tls must be 'none' or 'letsencrypt'")
+    if d["tls"] not in ("none", "letsencrypt", "wildcard"):
+        raise ApiError("tls must be 'none', 'letsencrypt' or 'wildcard'")
     d["force_https"] = bool(data.get("force_https", True))
     d["max_body"] = str(data.get("max_body", "100m") or "100m").strip().lower()
     if not BODY_RE.match(d["max_body"]):
@@ -527,6 +535,9 @@ def validate_domain(data, others, cfg, did=None, check_rules=True):
     for n in _names(d):
         if n in taken:
             raise ApiError("%s is already used by domain %s" % (n, taken[n]["domain"]))
+    if check_rules and d["enabled"] and d["tls"] == "wildcard" and not wildcard_for(cfg, d):
+        raise ApiError("no wildcard certificate covers %s - add one for its parent zone (a wildcard covers one level: "
+                       "*.example.com matches a.example.com, not a.b.example.com)" % ", ".join(_names(d)))
     if check_rules and d["enabled"]:
         for r in cfg.get("rules", []):
             if r["enabled"] and "tcp" in protos(r["proto"]):
@@ -538,17 +549,142 @@ def validate_domain(data, others, cfg, did=None, check_rules=True):
     return d
 
 
-def cert_paths(cfg, d):
-    base = os.path.join(cfg.get("letsencrypt_dir", "/etc/letsencrypt/live"), d["domain"])
+# DNS-01 providers: certbot plugin "dns-<key>" from Debian package, credentials written to an .ini file
+DNS_PROVIDERS = {
+    "cloudflare": {"label": "Cloudflare", "package": "python3-certbot-dns-cloudflare",
+                   "help": "API token with Zone / DNS / Edit permission for the zone",
+                   "fields": [{"key": "dns_cloudflare_api_token", "label": "API token", "secret": True}]},
+    "digitalocean": {"label": "DigitalOcean", "package": "python3-certbot-dns-digitalocean",
+                     "help": "Personal access token with write scope",
+                     "fields": [{"key": "dns_digitalocean_token", "label": "API token", "secret": True}]},
+    "linode": {"label": "Linode / Akamai", "package": "python3-certbot-dns-linode", "extra": {"dns_linode_version": "4"},
+               "help": "Personal access token with Domains read/write",
+               "fields": [{"key": "dns_linode_key", "label": "API token", "secret": True}]},
+    "dnsimple": {"label": "DNSimple", "package": "python3-certbot-dns-dnsimple", "help": "Account API token",
+                 "fields": [{"key": "dns_dnsimple_token", "label": "API token", "secret": True}]},
+    "ovh": {"label": "OVH", "package": "python3-certbot-dns-ovh",
+            "help": "Create keys at https://api.ovh.com/createToken/ with GET/POST/PUT/DELETE on /domain/zone/*",
+            "fields": [{"key": "dns_ovh_endpoint", "label": "Endpoint", "default": "ovh-eu"},
+                       {"key": "dns_ovh_application_key", "label": "Application key", "secret": True},
+                       {"key": "dns_ovh_application_secret", "label": "Application secret", "secret": True},
+                       {"key": "dns_ovh_consumer_key", "label": "Consumer key", "secret": True}]},
+    "rfc2136": {"label": "RFC 2136 (BIND, PowerDNS, Knot...)", "package": "python3-certbot-dns-rfc2136",
+                "help": "Dynamic DNS updates signed with a TSIG key",
+                "fields": [{"key": "dns_rfc2136_server", "label": "DNS server IP"},
+                           {"key": "dns_rfc2136_port", "label": "Port", "default": "53"},
+                           {"key": "dns_rfc2136_name", "label": "TSIG key name"},
+                           {"key": "dns_rfc2136_secret", "label": "TSIG secret", "secret": True},
+                           {"key": "dns_rfc2136_algorithm", "label": "Algorithm", "default": "HMAC-SHA512"}]},
+}
+
+
+def covers(zone, name):
+    """A wildcard cert for zone covers the zone itself and exactly one label below it."""
+    return name == zone or (name.endswith("." + zone) and "." not in name[:-len(zone) - 1])
+
+
+def wildcard_for(cfg, d):
+    return next((w for w in cfg.get("wildcards", []) if w["enabled"] and all(covers(w["zone"], n) for n in _names(d))), None)
+
+
+def wc_cert_name(w):
+    return "wildcard." + w["zone"]
+
+
+def domain_cert(cfg, d):
+    """(certbot cert name, CERT_JOBS key) used by a domain, or (None, None)."""
+    if d["tls"] == "letsencrypt":
+        return d["domain"], d["id"]
+    if d["tls"] == "wildcard":
+        w = wildcard_for(cfg, d)
+        if w:
+            return wc_cert_name(w), w["id"]
+    return None, None
+
+
+def validate_wildcard(data, others, wid=None):
+    if not isinstance(data, dict):
+        raise ApiError("wildcard must be an object")
+    w = {"id": wid or uuid.uuid4().hex[:8]}
+    if not re.match(r"^[0-9a-f]{1,16}$", w["id"]):
+        raise ApiError("invalid id")
+    zone = str(data.get("zone", "")).strip().lower().rstrip(".")
+    w["zone"] = zone[2:] if zone.startswith("*.") else zone
+    if not DOMAIN_RE.match(w["zone"]):
+        raise ApiError("invalid zone '%s' (e.g. example.com - the certificate covers it and *.example.com)" % zone)
+    w["provider"] = str(data.get("provider", ""))
+    if w["provider"] not in DNS_PROVIDERS:
+        raise ApiError("unknown DNS provider '%s'" % w["provider"])
+    try:
+        w["propagation"] = int(data.get("propagation", 0) or 0)
+    except (TypeError, ValueError):
+        raise ApiError("propagation wait must be a number of seconds")
+    if not 0 <= w["propagation"] <= 900:
+        raise ApiError("propagation wait: 0-900 seconds (0 = plugin default)")
+    w["enabled"] = bool(data.get("enabled", True))
+    for o in others:
+        if o["zone"] == w["zone"]:
+            raise ApiError("a wildcard for %s already exists" % w["zone"])
+    return w
+
+
+def cred_path(w):
+    return os.path.join(CONF_DIR, "dns", w["id"] + ".ini")
+
+
+def read_creds(w):
+    vals = {}
+    try:
+        with open(cred_path(w)) as f:
+            for line in f:
+                k, sep, v = line.partition("=")
+                if sep:
+                    vals[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return vals
+
+
+def build_creds(w, given, old_w=None):
+    """Merge submitted credential fields with the stored ones (empty field = keep)."""
+    prov = DNS_PROVIDERS[w["provider"]]
+    old = read_creds(old_w) if old_w and old_w["provider"] == w["provider"] else {}
+    given = given if isinstance(given, dict) else {}
+    vals = {}
+    for f in prov["fields"]:
+        v = str(given.get(f["key"], "") or "").strip() or old.get(f["key"], "") or f.get("default", "")
+        if not v:
+            raise ApiError("%s: %s is required" % (prov["label"], f["label"]))
+        if len(v) > 1000 or any(c in v for c in "\r\n"):
+            raise ApiError("%s: invalid value" % f["label"])
+        vals[f["key"]] = v
+    vals.update(prov.get("extra", {}))
+    return vals
+
+
+def write_creds(w, vals):
+    os.makedirs(os.path.dirname(cred_path(w)), mode=0o700, exist_ok=True)
+    tmp = cred_path(w) + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("# pve-portfwd: certbot %s credentials for %s\n" % (w["provider"], w["zone"]))
+        f.writelines("%s = %s\n" % kv for kv in vals.items())
+    os.replace(tmp, cred_path(w))
+
+
+def cert_paths(cfg, name):
+    base = os.path.join(cfg.get("letsencrypt_dir", "/etc/letsencrypt/live"), name)
     return os.path.join(base, "fullchain.pem"), os.path.join(base, "privkey.pem")
 
 
-def cert_info(cfg, d, fresh=False):
-    """{"exists": bool, "expires": ts, "days": int} for the domain's Let's Encrypt cert (cached 60s)."""
-    hit = CERT_CACHE.get(d["domain"])
+def cert_info(cfg, name, fresh=False):
+    """{"exists": bool, "expires": ts, "days": int} for a certbot certificate by name (cached 60s)."""
+    if not name:
+        return {"exists": False}
+    hit = CERT_CACHE.get(name)
     if hit and not fresh and time.time() - hit[0] < 60:
         return hit[1]
-    rc, out = sh(["openssl", "x509", "-noout", "-enddate", "-in", cert_paths(cfg, d)[0]])
+    rc, out = sh(["openssl", "x509", "-noout", "-enddate", "-in", cert_paths(cfg, name)[0]])
     info = {"exists": False}
     m = re.search(r"notAfter=(.+)", out or "") if rc == 0 else None
     if m:
@@ -557,7 +693,7 @@ def cert_info(cfg, d, fresh=False):
             info = {"exists": True, "expires": exp, "days": int((exp - time.time()) // 86400)}
         except ValueError:
             info = {"exists": True}
-    CERT_CACHE[d["domain"]] = (time.time(), info)
+    CERT_CACHE[name] = (time.time(), info)
     return info
 
 
@@ -593,7 +729,8 @@ def build_nginx(cfg):
     for d in cfg["domains"]:
         if not d["enabled"]:
             continue
-        tls = d["tls"] == "letsencrypt" and cert_info(cfg, d)["exists"]
+        cname = domain_cert(cfg, d)[0]
+        tls = cert_info(cfg, cname)["exists"]
         names = " ".join(_names(d))
         out += ["", "# %s -> %s:%d  (id %s)" % (d["domain"], d["ip"], d["port"], d["id"]),
                 "server {", "    listen 80;"] + (["    listen [::]:80;"] if v6 else []) + [
@@ -604,7 +741,7 @@ def build_nginx(cfg):
             out += nginx_proxy_block(d)
         out.append("}")
         if tls:
-            crt, key = cert_paths(cfg, d)
+            crt, key = cert_paths(cfg, cname)
             out += ["server {", "    listen 443 ssl http2;"] + (["    listen [::]:443 ssl http2;"] if v6 else []) + [
                 "    server_name %s;" % names,
                 "    ssl_certificate %s;" % crt,
@@ -633,7 +770,7 @@ def apply_nginx(cfg=None):
             return None  # domains never used: don't require nginx
         if not nginx_installed():
             NGINX["last_error"] = "nginx is not installed - run: apt install nginx" + (
-                " certbot" if any(d["tls"] == "letsencrypt" for d in active) else "")
+                " certbot" if any(d["tls"] != "none" for d in active) else "")
             return NGINX["last_error"]
         conf = build_nginx(cfg)
         if DRY_RUN:
@@ -676,49 +813,85 @@ def apply_nginx(cfg=None):
         return None
 
 
-def issue_cert(did):
-    """Request/renew a Let's Encrypt certificate in the background (certbot webroot)."""
-    cfg = STATE["cfg"]
-    d = next((x for x in cfg["domains"] if x["id"] == did), None)
-    if not d or d["tls"] != "letsencrypt" or not d["enabled"]:
+def run_certbot(key, cert_name, names, auth, plugin=None, package=None):
+    """certbot certonly in the background; progress in CERT_JOBS[key]. auth = authenticator arguments."""
+    if CERT_JOBS.get(key, {}).get("state") == "pending":
         return
-    if CERT_JOBS.get(did, {}).get("state") == "pending":
-        return
-    CERT_JOBS[did] = {"state": "pending", "msg": "requesting certificate...", "t": time.time()}
+    CERT_JOBS[key] = {"state": "pending", "msg": "requesting certificate for %s ..." % ", ".join(names), "t": time.time()}
+
+    def fail(msg):
+        CERT_JOBS[key] = {"state": "error", "msg": msg, "t": time.time()}
+        log("certbot failed for %s: %s" % (cert_name, msg), "error")
 
     def job():
+        cfg = STATE["cfg"]
         if sh(["certbot", "--version"])[0] != 0:
-            CERT_JOBS[did] = {"state": "error", "msg": "certbot is not installed - run: apt install certbot", "t": time.time()}
-            return
-        cmd = ["certbot", "certonly", "--webroot", "-w", cfg["acme_webroot"], "--non-interactive", "--agree-tos",
-               "--keep-until-expiring", "--expand", "--cert-name", d["domain"],
-               "--deploy-hook", "systemctl reload nginx"]
+            return fail("certbot is not installed - run: apt install certbot")
+        if plugin and not re.search(r"\* %s\b" % re.escape(plugin), sh(["certbot", "plugins"], timeout=60)[1]):
+            return fail("certbot plugin %s is missing - run: apt install %s" % (plugin, package))
+        cmd = ["certbot", "certonly"] + auth + [
+            "--non-interactive", "--agree-tos", "--keep-until-expiring", "--expand",
+            "--cert-name", cert_name, "--deploy-hook", "systemctl reload nginx"]
         cmd += ["-m", cfg["acme_email"]] if cfg.get("acme_email") else ["--register-unsafely-without-email"]
-        for n in _names(d):
+        for n in names:
             cmd += ["-d", n]
-        log("certbot: requesting certificate for %s" % ", ".join(_names(d)))
-        rc, out = run(cmd, timeout=300)
+        log("certbot: requesting %s for %s" % (cert_name, ", ".join(names)))
+        rc, out = run(cmd, timeout=900)
         if rc != 0:
             detail = [line.strip() for line in out.splitlines()
-                      if re.search(r"Detail:|Domain:|Type:|error|Error|problem", line)][:6]
-            CERT_JOBS[did] = {"state": "error", "msg": "\n".join(detail) or out[-500:], "t": time.time()}
-            log("certbot failed for %s: %s" % (d["domain"], CERT_JOBS[did]["msg"]), "error")
-            return
-        cert_info(cfg, d, fresh=True)
+                      if re.search(r"Detail:|Domain:|Type:|error|Error|problem|Unable|Invalid", line)][:6]
+            return fail("\n".join(detail) or out[-500:])
+        cert_info(cfg, cert_name, fresh=True)
         err = apply_nginx()
         msg = "certificate is valid, not due for renewal yet" if "no action taken" in out else "certificate installed"
-        CERT_JOBS[did] = {"state": "error" if err else "ok", "msg": err or msg, "t": time.time()}
-        log("certbot: %s - %s" % (d["domain"], CERT_JOBS[did]["msg"]))
+        CERT_JOBS[key] = {"state": "error" if err else "ok", "msg": err or msg, "t": time.time()}
+        log("certbot: %s - %s" % (cert_name, CERT_JOBS[key]["msg"]))
 
     threading.Thread(target=job, daemon=True).start()
+
+
+def issue_cert(did, force=False):
+    """Get the certificate a domain needs: per-domain HTTP-01, or its wildcard (only if missing unless force)."""
+    cfg = STATE["cfg"]
+    d = next((x for x in cfg["domains"] if x["id"] == did), None)
+    if not d or not d["enabled"]:
+        return
+    if d["tls"] == "wildcard":
+        w = wildcard_for(cfg, d)
+        if w and (force or not cert_info(cfg, wc_cert_name(w))["exists"]):
+            issue_wildcard(w["id"])
+    elif d["tls"] == "letsencrypt":
+        run_certbot(did, d["domain"], _names(d), ["--webroot", "-w", cfg["acme_webroot"]])
+
+
+def issue_wildcard(wid):
+    cfg = STATE["cfg"]
+    w = next((x for x in cfg["wildcards"] if x["id"] == wid), None)
+    if not w or not w["enabled"]:
+        return
+    prov, p = w["provider"], DNS_PROVIDERS[w["provider"]]
+    auth = ["--authenticator", "dns-" + prov, "--dns-%s-credentials" % prov, cred_path(w)]
+    if w["propagation"]:
+        auth += ["--dns-%s-propagation-seconds" % prov, str(w["propagation"])]
+    run_certbot(wid, wc_cert_name(w), [w["zone"], "*." + w["zone"]], auth, plugin="dns-" + prov, package=p["package"])
+
+
+def wildcard_status(cfg):
+    return {w["id"]: {"cert": cert_info(cfg, wc_cert_name(w)), "job": CERT_JOBS.get(w["id"]),
+                      "has_credentials": os.path.exists(cred_path(w)),
+                      "used_by": [d["domain"] for d in cfg["domains"] if d["tls"] == "wildcard"
+                                  and (wildcard_for(cfg, d) or {}).get("id") == w["id"]]}
+            for w in cfg.get("wildcards", [])}
 
 
 def domain_status(cfg):
     res = {}
     for d in cfg["domains"]:
-        st = {"job": CERT_JOBS.get(d["id"])}
-        if d["tls"] == "letsencrypt":
-            st["cert"] = cert_info(cfg, d)
+        name, key = domain_cert(cfg, d)
+        st = {"job": CERT_JOBS.get(key) if key else None, "cert": cert_info(cfg, name) if name else None}
+        if d["tls"] == "wildcard":
+            w = wildcard_for(cfg, d)
+            st["wildcard"] = "*." + w["zone"] if w else None
         res[d["id"]] = st
     return res
 
@@ -773,12 +946,16 @@ def test_domain(d):
     res, ms = tcp_probe(d["ip"], d["port"])
     add("upstream %s:%d" % (d["ip"], d["port"]), _st(res == "ok"),
         "connected in %dms" % ms if res == "ok" else res + (" - nothing listens on that port" if res == "refused" else ""))
-    tls = d["tls"] == "letsencrypt" and cert_info(cfg, d)["exists"]
-    if d["tls"] == "letsencrypt":
-        ci, job = cert_info(cfg, d, fresh=True), CERT_JOBS.get(d["id"])
+    cname, key = domain_cert(cfg, d)
+    tls = cert_info(cfg, cname)["exists"]
+    if d["tls"] == "wildcard" and not cname:
+        add("certificate", "fail", "no enabled wildcard certificate covers " + ", ".join(_names(d)))
+    elif cname:
+        ci, job = cert_info(cfg, cname, fresh=True), CERT_JOBS.get(key)
+        what = "wildcard *.%s" % cname[len("wildcard."):] if d["tls"] == "wildcard" else "certificate"
         if ci["exists"]:
             days = ci.get("days", 0)
-            add("certificate", "ok" if days >= 14 else "warn", "expires in %d days (certbot renews automatically)" % days)
+            add("certificate", "ok" if days >= 14 else "warn", "%s expires in %d days (certbot renews automatically)" % (what, days))
         else:
             add("certificate", "warn" if job and job["state"] == "pending" else "fail",
                 job["msg"] if job else "not issued yet - click Cert")
@@ -897,11 +1074,27 @@ def checks():
             if m and "nginx" not in line:
                 add("port %s" % m.group(1), "warn", "used by another program, not nginx: " + line.split()[-1])
         le = [d for d in cfg["domains"] if d["tls"] == "letsencrypt" and d["enabled"]]
-        if le:
+        wcs = [w for w in cfg.get("wildcards", []) if w["enabled"]]
+        if le or wcs:
             rc, out = sh(["certbot", "--version"])
             add("certbot installed", _st(rc == 0), out if rc == 0 else "apt install certbot")
+        plugins = sh(["certbot", "plugins"], timeout=60)[1] if wcs else ""
+        for w in wcs:
+            p = DNS_PROVIDERS[w["provider"]]
+            ok = bool(re.search(r"\* dns-%s\b" % w["provider"], plugins))
+            add("plugin dns-%s" % w["provider"], _st(ok), "installed" if ok else "apt install " + p["package"])
+            add("credentials *.%s" % w["zone"], _st(os.path.exists(cred_path(w))), cred_path(w))
+            ci, job = cert_info(cfg, wc_cert_name(w)), CERT_JOBS.get(w["id"])
+            if ci["exists"]:
+                add("wildcard *.%s" % w["zone"], _st(ci.get("days", 0) >= 14, warn=True), "expires in %s days" % ci.get("days", "?"))
+            else:
+                add("wildcard *.%s" % w["zone"], "warn" if job and job["state"] == "pending" else "fail",
+                    job["msg"] if job else "not issued")
+        for d in cfg["domains"]:
+            if d["enabled"] and d["tls"] == "wildcard" and not wildcard_for(cfg, d):
+                add("domain %s" % d["domain"], "fail", "set to wildcard TLS, but no enabled wildcard covers it")
         for d in le:
-            ci, job = cert_info(cfg, d), CERT_JOBS.get(d["id"])
+            ci, job = cert_info(cfg, d["domain"]), CERT_JOBS.get(d["id"])
             if ci["exists"]:
                 add("certificate %s" % d["domain"], _st(ci.get("days", 0) >= 14, warn=True), "expires in %s days" % ci.get("days", "?"))
             else:
@@ -1228,6 +1421,7 @@ class Handler(BaseHTTPRequestHandler):
                 "status": {"ip_forward": ip_forward_on(), "active": DRY_RUN or hooks_active(),
                            "last_apply": STATE["last_apply"], "last_error": STATE["last_error"]},
                 "domains": cfg["domains"], "domain_status": domain_status(cfg), "acme_email": cfg.get("acme_email", ""),
+                "wildcards": cfg["wildcards"], "wildcard_status": wildcard_status(cfg), "dns_providers": DNS_PROVIDERS,
                 "nginx": {"last_apply": NGINX["last_apply"], "last_error": NGINX["last_error"]},
             })
         if path == "/api/guests" and method == "GET":
@@ -1263,11 +1457,23 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError("domain not found", 404)
             if m.group(2) == "test":
                 return self.send(200, {"steps": test_domain(dom)})
-            if dom["tls"] != "letsencrypt" or not dom["enabled"]:
-                raise ApiError("domain is disabled or does not use Let's Encrypt")
-            CERT_JOBS.pop(dom["id"], None)
-            issue_cert(dom["id"])
+            name, key = domain_cert(cfg, dom)
+            if not name or not dom["enabled"]:
+                raise ApiError("domain is disabled, HTTP only, or no wildcard covers it")
+            CERT_JOBS.pop(key, None)
+            issue_cert(dom["id"], force=True)
             return self.send(200, {"ok": True})
+        m = re.match(r"^/api/wildcards/([0-9a-f]{1,16})/cert$", path)
+        if m and method == "POST":
+            w = next((x for x in cfg["wildcards"] if x["id"] == m.group(1)), None)
+            if not w or not w["enabled"]:
+                raise ApiError("wildcard not found or disabled", 404)
+            CERT_JOBS.pop(w["id"], None)
+            issue_wildcard(w["id"])
+            return self.send(200, {"ok": True})
+        m = re.match(r"^/api/wildcards(?:/([0-9a-f]{1,16}))?$", path)
+        if m:
+            return self.wildcards_api(method, m.group(1), cfg, user)
         m = re.match(r"^/api/domains(?:/([0-9a-f]{1,16}))?$", path)
         if m:
             return self.domains_api(method, m.group(1), cfg, user)
@@ -1338,9 +1544,56 @@ class Handler(BaseHTTPRequestHandler):
             save_config(new)
             STATE["cfg"] = new
             log("%s %s domain %s" % (user, method, dom["domain"] if dom else did))
-        if dom and dom["tls"] == "letsencrypt" and dom["enabled"]:
+        if dom and dom["tls"] != "none" and dom["enabled"]:
             issue_cert(dom["id"])  # no-op for certbot if the cert already covers these names
         return self.send(200, {"ok": True})
+
+    def wildcards_api(self, method, wid, cfg, user):
+        with LOCK:
+            wcs = list(cfg["wildcards"])
+            idx = next((i for i, w in enumerate(wcs) if w["id"] == wid), None) if wid else None
+            if wid and idx is None:
+                raise ApiError("wildcard not found", 404)
+            old = wcs[idx] if idx is not None else None
+            w, body, creds = None, {}, None
+            if method in ("POST", "PUT") and (method == "POST") == (not wid):
+                body = self.body()
+                w = validate_wildcard(body, [x for x in wcs if x["id"] != wid], wid)
+                if old and w["zone"] != old["zone"]:
+                    raise ApiError("the zone can't be changed - add a new wildcard instead")
+                creds = build_creds(w, body.get("credentials"), old)
+                if idx is None:
+                    wcs.append(w)
+                else:
+                    wcs[idx] = w
+            elif method == "DELETE" and wid:
+                wcs.pop(idx)
+            else:
+                raise ApiError("method not allowed", 405)
+            new = dict(cfg, wildcards=wcs)
+            orphans = [d["domain"] for d in cfg["domains"] if d["enabled"] and d["tls"] == "wildcard"
+                       and wildcard_for(cfg, d) and not wildcard_for(new, d)]
+            if orphans:
+                raise ApiError("still used by %s - switch those domains to another HTTPS option first" % ", ".join(orphans))
+            email = str(body.get("acme_email", "") or "").strip()
+            if email:
+                if not EMAIL_RE.match(email):
+                    raise ApiError("invalid Let's Encrypt email")
+                new["acme_email"] = email
+            if creds is not None:
+                write_creds(w, creds)
+            elif old:
+                try:
+                    os.remove(cred_path(old))
+                except OSError:
+                    pass
+            save_config(new)
+            STATE["cfg"] = new
+            log("%s %s wildcard *.%s" % (user, method, (w or old)["zone"]))
+            err = apply_nginx(new)  # enabling/disabling changes which certificate domains use
+        if w and w["enabled"]:
+            issue_wildcard(w["id"])
+        return self.send(200, {"ok": True, "warning": err})
 
 
 class Server(ThreadingHTTPServer):
@@ -1464,6 +1717,15 @@ INDEX_HTML = r"""<!doctype html>
       </table>
       <p id="domEmpty" class="muted pad" hidden>No domains yet. Point a DNS A record at this host, then click <b>+ Add domain</b>.</p>
     </div>
+    <div class="sub-head"><h2>Wildcard certificates</h2><button id="addWcBtn" class="ghost">+ Add wildcard</button></div>
+    <div class="card scroll">
+      <table>
+        <thead><tr><th>On</th><th>Certificate</th><th>DNS provider</th><th>Status</th><th>Used by</th><th></th></tr></thead>
+        <tbody id="wildcards"></tbody>
+      </table>
+      <p id="wcEmpty" class="muted pad" hidden>One certificate for <b>example.com</b> + <b>*.example.com</b>, verified through your
+        DNS provider's API. It doesn't need port 80, and new subdomains get HTTPS instantly: pick <i>Wildcard</i> as the domain's HTTPS option.</p>
+    </div>
     <p class="muted small">nginx on this host answers on ports 80/443 and proxies each domain to a guest
       (<code>/etc/nginx/conf.d/pve-portfwd.conf</code>). With Let's Encrypt, certbot gets and renews certificates automatically.
       DNS must point at this host's public IP, and if the host is behind a router, the router must forward ports 80 and 443 to it.</p>
@@ -1497,15 +1759,36 @@ INDEX_HTML = r"""<!doctype html>
       <label>Upstream IP<input name="ip" required placeholder="10.10.10.10"></label>
       <label>Upstream port<input name="port" required value="80" inputmode="numeric"></label>
       <label class="check wide"><input type="checkbox" name="upstream_https"> Upstream uses HTTPS (self-signed certificates are accepted)</label>
-      <label>HTTPS<select name="tls"><option value="letsencrypt">Let's Encrypt (automatic)</option><option value="none">None (HTTP only)</option></select></label>
-      <label class="le">Let's Encrypt email<input name="acme_email" type="email" placeholder="expiry notices (optional)"></label>
-      <label class="check wide le"><input type="checkbox" name="force_https" checked> Redirect HTTP to HTTPS</label>
+      <label>HTTPS<select name="tls"><option value="letsencrypt">Let's Encrypt (automatic)</option>
+        <option value="wildcard">Wildcard certificate (DNS)</option><option value="none">None (HTTP only)</option></select></label>
+      <label class="le-only">Let's Encrypt email<input name="acme_email" type="email" placeholder="expiry notices (optional)"></label>
+      <p id="wcHint" class="hint wide" hidden></p>
+      <label class="check wide tls-on"><input type="checkbox" name="force_https" checked> Redirect HTTP to HTTPS</label>
       <label>Max upload size<input name="max_body" value="100m" placeholder="100m, 2g, 0 = unlimited"></label>
       <label>Allowed sources<input name="source" placeholder="anyone (or 203.0.113.0/24 …)"></label>
       <label class="check wide"><input type="checkbox" name="enabled" checked> Enabled</label>
     </div>
     <p id="domErr" class="err"></p>
     <div class="actions"><button type="button" id="domCancel" class="ghost">Cancel</button><button type="submit">Save</button></div>
+  </form>
+</dialog>
+
+<dialog id="wcDlg">
+  <form id="wcForm" class="form">
+    <h2 id="wcTitle">Add wildcard certificate</h2>
+    <div class="grid">
+      <label class="wide">Zone<input name="zone" required placeholder="example.com" autocapitalize="off" spellcheck="false"></label>
+      <p class="hint wide">Covers <b id="wcCovers">example.com and *.example.com</b>. One level only: a.example.com yes, a.b.example.com no.</p>
+      <label class="wide">DNS provider<select name="provider"></select></label>
+      <p id="wcHelp" class="hint wide"></p>
+      <div id="wcFields" class="grid wide"></div>
+      <label>Propagation wait (seconds)<input name="propagation" inputmode="numeric" placeholder="plugin default"></label>
+      <label>Let's Encrypt email<input name="acme_email" type="email" placeholder="expiry notices (optional)"></label>
+      <label class="check wide"><input type="checkbox" name="enabled" checked> Enabled</label>
+    </div>
+    <p class="hint">Credentials are stored on this host only (mode 0600) and are never shown again.</p>
+    <p id="wcErr" class="err"></p>
+    <div class="actions"><button type="button" id="wcCancel" class="ghost">Cancel</button><button type="submit">Save &amp; issue</button></div>
   </form>
 </dialog>
 
@@ -1607,6 +1890,10 @@ font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre}
 #testDlg{width:min(640px,calc(100vw - 32px))}#testDlg .checks{border:1px solid var(--line);border-radius:8px;margin-bottom:10px}
 .spin{color:var(--muted);padding:14px}
 .banner{padding:10px 14px;margin-bottom:12px;color:var(--bad);border-color:var(--bad);white-space:pre-wrap;font-size:13px}
+.sub-head{display:flex;align-items:center;gap:10px;margin:22px 0 10px}.sub-head h2{margin:0;font-size:15px}
+.sub-head button{padding:4px 12px;font-size:13px}
+.hint{margin:-4px 0 0;font-size:12px;color:var(--muted)}.hint.bad{color:var(--bad)}
+#wcFields:empty{display:none}
 .names a{color:var(--fg);text-decoration:none;font-weight:500}.names a:hover{text-decoration:underline}
 .names .alias{display:block;color:var(--muted);font-size:12px}
 .mockbar{padding:12px 14px;margin-bottom:12px;display:flex;flex-direction:column;gap:6px;border-style:dashed;border-color:var(--warn)}
@@ -1668,7 +1955,7 @@ async function load() {
   render();
   if (!load.started) { load.started = true; setView(); }
   if (!timer) timer = setInterval(() => {
-    if (!document.hidden && view !== 'debug' && !$('#dlg').open && !$('#domDlg').open && !$('#testDlg').open) load().catch(() => {});
+    if (!document.hidden && view !== 'debug' && ![...document.querySelectorAll('dialog')].some(x => x.open)) load().catch(() => {});
   }, 5000);
 }
 
@@ -1784,9 +2071,21 @@ $('#loginForm').addEventListener('submit', async e => {
 });
 
 // ---- domains
+function certChip(cert, job, label) {
+  if (job && job.state === 'pending') return el('span', {class: 'chip warn', textContent: 'issuing…', title: job.msg});
+  if (cert && cert.exists) return el('span', {class: 'chip ' + (cert.days < 14 ? 'warn' : 'ok'),
+    textContent: label + ' · ' + cert.days + 'd', title: 'certificate expires in ' + cert.days + ' days (auto-renewed)'});
+  if (job && job.state === 'error') return el('span', {class: 'chip bad', textContent: 'cert error', title: job.msg});
+  return el('span', {class: 'chip bad', textContent: 'no certificate'});
+}
+
 function tlsCell(d) {
   const st = (S.domain_status || {})[d.id] || {}, job = st.job, cert = st.cert;
-  if (d.tls !== 'letsencrypt') return el('span', {class: 'tag', textContent: 'http only'});
+  if (d.tls === 'none') return el('span', {class: 'tag', textContent: 'http only'});
+  if (d.tls === 'wildcard') {
+    if (!st.wildcard) return el('span', {class: 'chip bad', textContent: 'no wildcard', title: 'no enabled wildcard certificate covers this domain'});
+    const c = certChip(cert, job, st.wildcard); return c;
+  }
   if (job && job.state === 'pending') return el('span', {class: 'chip warn', textContent: 'issuing…'});
   if (cert && cert.exists) return el('span', {class: 'chip ' + (cert.days < 14 ? 'warn' : 'ok'),
     textContent: 'https · ' + cert.days + 'd', title: 'certificate expires in ' + cert.days + ' days (auto-renewed)'});
@@ -1794,7 +2093,28 @@ function tlsCell(d) {
   return el('span', {class: 'chip bad', textContent: 'no certificate'});
 }
 
+function renderWildcards() {
+  const tb = $('#wildcards'), ws = S.wildcards || [], prov = S.dns_providers || {};
+  tb.replaceChildren();
+  $('#wcEmpty').hidden = ws.length > 0;
+  for (const w of ws) {
+    const st = (S.wildcard_status || {})[w.id] || {};
+    tb.append(el('tr', {class: w.enabled ? '' : 'off'},
+      el('td', {}, el('input', {type: 'checkbox', class: 'switch', checked: w.enabled, title: w.enabled ? 'Disable' : 'Enable',
+        onchange: e => saveWildcard(w.id, Object.assign({}, w, {enabled: e.target.checked}))})),
+      el('td', {class: 'names'}, el('span', {class: 'mono', textContent: '*.' + w.zone}), el('span', {class: 'alias', textContent: '+ ' + w.zone})),
+      el('td', {textContent: (prov[w.provider] || {}).label || w.provider}),
+      el('td', {}, certChip(st.cert, st.job, 'valid')),
+      el('td', {class: 'muted small', textContent: (st.used_by || []).join(', ') || '—'}),
+      el('td', {class: 'num'},
+        el('button', {class: 'link', textContent: 'Issue', title: 'Request / renew now', onclick: () => wcCert(w)}),
+        el('button', {class: 'link', textContent: 'Edit', onclick: () => openWcDlg(w)}),
+        el('button', {class: 'link del', textContent: 'Delete', onclick: () => delWildcard(w)}))));
+  }
+}
+
 function renderDomains() {
+  renderWildcards();
   const tb = $('#domains'), ds = S.domains || [];
   tb.replaceChildren();
   $('#domEmpty').hidden = ds.length > 0;
@@ -1803,7 +2123,7 @@ function renderDomains() {
     tb.append(el('tr', {class: d.enabled ? '' : 'off'},
       el('td', {}, el('input', {type: 'checkbox', class: 'switch', checked: d.enabled, title: d.enabled ? 'Disable' : 'Enable',
         onchange: e => saveDomain(d.id, Object.assign({}, d, {enabled: e.target.checked}))})),
-      el('td', {class: 'names'}, el('a', {href: (d.tls === 'letsencrypt' ? 'https://' : 'http://') + d.domain, target: '_blank', rel: 'noopener', textContent: d.domain}),
+      el('td', {class: 'names'}, el('a', {href: (d.tls !== 'none' ? 'https://' : 'http://') + d.domain, target: '_blank', rel: 'noopener', textContent: d.domain}),
         ...d.aliases.map(a => el('span', {class: 'alias', textContent: a}))),
       el('td', {class: 'arrow', textContent: '→'}),
       el('td', {class: 'mono', textContent: (d.upstream_https ? 'https://' : 'http://') + d.ip + ':' + d.port}),
@@ -1811,7 +2131,7 @@ function renderDomains() {
       el('td', {class: 'mono', textContent: d.source.length ? d.source.join(', ') : 'anyone'}),
       el('td', {class: 'num'},
         el('button', {class: 'link', textContent: 'Test', onclick: () => runTestUrl('Test: ' + d.domain + ' → ' + d.ip + ':' + d.port, '/api/domains/' + d.id + '/test')}),
-        d.tls === 'letsencrypt' ? el('button', {class: 'link', textContent: 'Cert', title: 'Request / renew certificate now', onclick: () => cert(d)}) : null,
+        d.tls !== 'none' ? el('button', {class: 'link', textContent: 'Cert', title: 'Request / renew certificate now', onclick: () => cert(d)}) : null,
         el('button', {class: 'link', textContent: 'Edit', onclick: () => openDomDlg(d)}),
         el('button', {class: 'link del', textContent: 'Delete', onclick: () => delDomain(d)}))));
   }
@@ -1857,8 +2177,23 @@ function openDomDlg(d) {
   f.domain.focus();
   fillGuests(f.guest);
 }
-function toggleLe() { const le = $('#domForm').tls.value === 'letsencrypt'; for (const x of document.querySelectorAll('#domForm .le')) x.hidden = !le; }
+const coversName = (zone, n) => n === zone || (n.endsWith('.' + zone) && !n.slice(0, -zone.length - 1).includes('.'));
+function toggleLe() {
+  const f = $('#domForm'), tls = f.tls.value, hint = $('#wcHint');
+  for (const x of document.querySelectorAll('#domForm .le-only')) x.hidden = tls !== 'letsencrypt';
+  for (const x of document.querySelectorAll('#domForm .tls-on')) x.hidden = tls === 'none';
+  hint.hidden = tls !== 'wildcard';
+  if (tls !== 'wildcard') return;
+  const names = [f.domain.value, ...f.aliases.value.split(/[\s,]+/)].map(x => x.trim().toLowerCase()).filter(Boolean);
+  const w = (S.wildcards || []).find(w => w.enabled && names.length && names.every(n => coversName(w.zone, n)));
+  hint.classList.toggle('bad', !w);
+  hint.textContent = !names.length ? 'Enter the domain to find its wildcard certificate.'
+    : w ? 'Uses the wildcard certificate *.' + w.zone + '.'
+    : 'No wildcard certificate covers ' + names.join(', ') + ' - add one below the domains table first.';
+}
 $('#domForm').tls.addEventListener('change', toggleLe);
+$('#domForm').domain.addEventListener('input', toggleLe);
+$('#domForm').aliases.addEventListener('input', toggleLe);
 $('#domForm').upstream_https.addEventListener('change', e => {
   const p = $('#domForm').port; if (e.target.checked && p.value === '80') p.value = '443'; else if (!e.target.checked && p.value === '443') p.value = '80';
 });
@@ -1878,6 +2213,66 @@ $('#domForm').addEventListener('submit', async e => {
   btn.disabled = false;
 });
 $('#domCancel').onclick = () => $('#domDlg').close();
+
+let editingWc = null;
+function wcFields() {
+  const f = $('#wcForm'), p = (S.dns_providers || {})[f.provider.value] || {fields: []}, box = $('#wcFields');
+  $('#wcHelp').textContent = (p.help ? p.help + '. ' : '') + 'Needs: apt install ' + p.package;
+  box.replaceChildren(...p.fields.map(fd => el('label', {}, fd.label,
+    el('input', {name: 'cred_' + fd.key, type: fd.secret ? 'password' : 'text', autocomplete: 'off', spellcheck: false,
+      value: editingWc && editingWc.provider === f.provider.value && !fd.secret ? '' : (fd.default || ''),
+      placeholder: editingWc && editingWc.provider === f.provider.value ? 'saved - leave empty to keep' : (fd.default || '')}))));
+}
+function openWcDlg(w) {
+  editingWc = w || null;
+  const f = $('#wcForm');
+  $('#wcTitle').textContent = w ? 'Edit wildcard *.' + w.zone : 'Add wildcard certificate';
+  $('#wcErr').textContent = '';
+  f.provider.replaceChildren(...Object.entries(S.dns_providers || {}).map(([k, p]) => el('option', {value: k, textContent: p.label})));
+  f.zone.value = w ? w.zone : ''; f.zone.disabled = !!w;
+  f.provider.value = w ? w.provider : 'cloudflare';
+  f.propagation.value = w && w.propagation ? w.propagation : '';
+  f.acme_email.value = S.acme_email || ''; f.enabled.checked = w ? w.enabled : true;
+  wcCovers(); wcFields();
+  $('#wcDlg').showModal();
+  (w ? f.provider : f.zone).focus();
+}
+function wcCovers() {
+  const z = $('#wcForm').zone.value.trim().toLowerCase().replace(/^\*\./, '') || 'example.com';
+  $('#wcCovers').textContent = z + ' and *.' + z;
+}
+$('#wcForm').zone.addEventListener('input', wcCovers);
+$('#wcForm').provider.addEventListener('change', wcFields);
+$('#wcForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const f = e.target, creds = {};
+  for (const i of $('#wcFields').querySelectorAll('input')) if (i.value.trim()) creds[i.name.slice(5)] = i.value.trim();
+  const d = {zone: f.zone.value.trim(), provider: f.provider.value, propagation: f.propagation.value.trim() || 0,
+    acme_email: f.acme_email.value.trim(), enabled: f.enabled.checked, credentials: creds};
+  const btn = f.querySelector('button[type=submit]'); btn.disabled = true;
+  try {
+    await api(editingWc ? 'PUT' : 'POST', editingWc ? '/api/wildcards/' + editingWc.id : '/api/wildcards', d);
+    $('#wcDlg').close(); domFlash(d.enabled ? 'Saved - requesting wildcard certificate (DNS check takes ~30s)…' : 'Saved');
+    load().catch(() => {});
+  } catch (err) { $('#wcErr').textContent = err.message; }
+  btn.disabled = false;
+});
+$('#wcCancel').onclick = () => $('#wcDlg').close();
+$('#addWcBtn').onclick = () => openWcDlg(null);
+async function saveWildcard(id, w) {
+  try { await api('PUT', '/api/wildcards/' + id, w); domFlash('Saved'); } catch (e) { domFlash(e.message, true); }
+  load().catch(() => {});
+}
+async function delWildcard(w) {
+  if (!confirm('Delete wildcard *.' + w.zone + '? Its stored DNS credentials are removed (the certificate files are kept).')) return;
+  try { await api('DELETE', '/api/wildcards/' + w.id); domFlash('Deleted'); } catch (e) { domFlash(e.message, true); }
+  load().catch(() => {});
+}
+async function wcCert(w) {
+  try { await api('POST', '/api/wildcards/' + w.id + '/cert', {}); domFlash('Requesting *.' + w.zone + ' (DNS check takes ~30s)…'); }
+  catch (e) { domFlash(e.message, true); }
+  load().catch(() => {});
+}
 $('#addDomBtn').onclick = () => openDomDlg(null);
 
 // ---- checks list (debug tab + rule test)
@@ -1998,8 +2393,8 @@ def main():
   apply            re-apply saved rules
   flush            remove all forwarding rules and chains (config is kept)
   passwd           set a local login instead of Proxmox accounts
-  domains          list domains, upstreams and certificates
-  cert DOMAIN      request / renew the Let's Encrypt certificate now
+  domains          list domains, wildcard certificates and expiry
+  cert NAME        request / renew a certificate now (domain, or *.zone for a wildcard)
   mock SCENARIO    (--mock only) break the simulated host: %s
 
 local development (macOS etc.):
@@ -2031,6 +2426,10 @@ local development (macOS etc.):
     if MOCK and fresh:
         for r in MOCK.sample_rules():
             cfg["rules"].append(validate_rule(r, cfg["rules"], cfg))
+        for w in MOCK.sample_wildcards():
+            wc = validate_wildcard(w, cfg["wildcards"])
+            write_creds(wc, build_creds(wc, w["credentials"]))
+            cfg["wildcards"].append(wc)
         for d in MOCK.sample_domains():
             cfg["domains"].append(validate_domain(d, cfg["domains"], cfg))
         cfg["acme_email"] = "admin@example.com"
@@ -2056,19 +2455,37 @@ local development (macOS etc.):
             print(fmt % ("ID", "ON", "DOMAIN", "UPSTREAM", "TLS"))
         for d in cfg["domains"]:
             tls = "http only"
-            if d["tls"] == "letsencrypt":
-                ci = cert_info(cfg, d)
-                tls = "LE: expires in %s days" % ci.get("days", "?") if ci["exists"] else "LE: no certificate yet"
+            name = domain_cert(cfg, d)[0]
+            if d["tls"] != "none":
+                ci = cert_info(cfg, name)
+                kind = "wildcard" if d["tls"] == "wildcard" else "LE"
+                tls = ("%s: expires in %s days" % (kind, ci.get("days", "?")) if ci["exists"]
+                       else "%s: no certificate yet" % kind if name else "wildcard: none covers it")
             print(fmt % (d["id"], "yes" if d["enabled"] else "no", " ".join(_names(d)),
                          "%s://%s:%d" % ("https" if d["upstream_https"] else "http", d["ip"], d["port"]), tls))
+        if cfg["wildcards"]:
+            print("\nWILDCARD CERTIFICATES")
+            for w in cfg["wildcards"]:
+                ci = cert_info(cfg, wc_cert_name(w))
+                print("  %-9s %-3s *.%-30s %-14s %s" % (w["id"], "yes" if w["enabled"] else "no", w["zone"], w["provider"],
+                      "expires in %s days" % ci.get("days", "?") if ci["exists"] else "not issued"))
     elif a.cmd == "cert":
-        d = next((x for x in cfg["domains"] if a.rules and a.rules[0] in (x["id"], x["domain"])), None)
-        if not d:
-            sys.exit("usage: cert DOMAIN (one of: %s)" % ", ".join(x["domain"] for x in cfg["domains"] if x["tls"] == "letsencrypt"))
-        issue_cert(d["id"])
-        while CERT_JOBS.get(d["id"], {}).get("state") == "pending":
+        q = a.rules[0].lower() if a.rules else ""
+        w = next((x for x in cfg["wildcards"] if q in (x["id"], x["zone"], "*." + x["zone"], wc_cert_name(x))), None)
+        d = next((x for x in cfg["domains"] if q in (x["id"], x["domain"])), None)
+        if w:
+            key = w["id"]
+            issue_wildcard(key)
+        elif d:
+            key = domain_cert(cfg, d)[1] or d["id"]
+            issue_cert(d["id"], force=True)
+        else:
+            sys.exit("usage: cert DOMAIN|*.ZONE (one of: %s)" % ", ".join(
+                [x["domain"] for x in cfg["domains"] if x["tls"] == "letsencrypt"] + ["*." + x["zone"] for x in cfg["wildcards"]]))
+        time.sleep(0.1)
+        while CERT_JOBS.get(key, {}).get("state") == "pending":
             time.sleep(0.5)
-        job = CERT_JOBS.get(d["id"]) or {"state": "error", "msg": "domain is disabled or not using Let's Encrypt"}
+        job = CERT_JOBS.get(key) or {"state": "error", "msg": "disabled, HTTP only, or no wildcard covers it"}
         print("%s: %s" % (job["state"], job["msg"]))
         sys.exit(0 if job["state"] == "ok" else 1)
     elif a.cmd == "status":
