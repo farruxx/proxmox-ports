@@ -41,6 +41,8 @@ The **Domains** tab maps hostnames to guests: `cloud.example.com` → `10.10.10.
 
 ### Wildcard certificates (`*.example.com`)
 
+> Step-by-step setup (DNS records, API tokens, troubleshooting): see [wildcard.md](wildcard.md).
+
 One certificate covers `example.com` and every `*.example.com` subdomain. Let's Encrypt only issues wildcards through a **DNS-01** check, so certbot creates a TXT record through your DNS provider's API. Port 80 doesn't have to be reachable for this.
 
 1. Install the certbot plugin for your provider (they're all Debian packages):
