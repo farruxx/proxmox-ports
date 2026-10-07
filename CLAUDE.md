@@ -16,6 +16,7 @@ Guidance for AI-assisted work on **pve-gateway**: a web UI that runs on a Proxmo
 | `pve-gateway.py` | Everything: config, validation, iptables, nginx/certbot, diagnostics, auth, HTTP API, embedded UI, CLI |
 | `dev/mock.py` | Simulated Proxmox host (iptables, ip, ss, ping, conntrack, pvesh, qm, pct, nginx, certbot, openssl, systemctl, DNS) |
 | `dev.sh` | `python3 pve-gateway.py --mock "$@"` |
+| `dev/screenshots.sh` + `.mjs` | Regenerates `docs/screenshots/*.png` (README) from mock mode via headless Chrome; rerun after visible UI changes |
 | `install.sh` | Installs on a PVE host (`--with-nginx`, `uninstall`) |
 | `pve-gateway.service` | systemd unit |
 | `README.md`, `wildcard.md` | User docs; keep them in sync with behavior changes |

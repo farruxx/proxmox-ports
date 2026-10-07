@@ -5,6 +5,21 @@ A small web UI that turns a Proxmox VE host into the gateway for its VMs and con
 - **Ports:** forward host ports to guests (iptables DNAT).
 - **Domains:** route `app.example.com` → guest `ip:port` through nginx, with automatic Let's Encrypt and wildcard (`*.example.com`) certificates.
 
+![Domains: reverse proxy with Let's Encrypt and wildcard certificates](docs/screenshots/domains.png)
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Port forwarding rules with live hit counters](docs/screenshots/ports.png) | ![Add a domain: pick a guest, choose HTTPS](docs/screenshots/add-domain.png) |
+| **Ports**: forward host ports to guests, with source/interface filters and live hit counters | **Add domain**: pick a guest, choose Let's Encrypt, a wildcard certificate or plain HTTP |
+| ![Built-in test explains what is wrong](docs/screenshots/domain-test.png) | ![Wildcard certificate via DNS provider API](docs/screenshots/wildcard.png) |
+| **Test**: checks DNS, nginx, the upstream, the certificate and a real request, with how to fix each failure | **Wildcard certificates**: `*.example.com` through your DNS provider's API ([guide](wildcard.md)) |
+| ![Debug tab with health checks](docs/screenshots/debug.png) | ![Works on a phone, light and dark](docs/screenshots/mobile.png) |
+| **Debug**: health checks, raw iptables/nginx/certbot output, log and a downloadable report | **Phone and dark mode** supported |
+
+<sub>Screenshots use sample data from the built-in mock mode (`./dev.sh`). Regenerate them with `dev/screenshots.sh`.</sub>
+
 > Upgrading from **pve-portfwd** (the old name)? Run `sh install.sh` as usual. It migrates the config, DNS credentials, ACME webroot and certbot renewal settings, and removes the old service and iptables chains.
 
 - **No dependencies.** It's one Python 3 file using only the standard library, and it drives `iptables`. Both already ship with Proxmox VE 7 and 8.

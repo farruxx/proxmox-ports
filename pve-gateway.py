@@ -1900,6 +1900,7 @@ font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre}
 .sub-head{display:flex;align-items:center;gap:10px;margin:22px 0 10px}.sub-head h2{margin:0;font-size:15px}
 .sub-head button{padding:4px 12px;font-size:13px}
 .hint{margin:-4px 0 0;font-size:12px;color:var(--muted)}.hint.bad{color:var(--bad)}
+form > .hint{margin:12px 0 0}
 #wcFields:empty{display:none}
 .names a{color:var(--fg);text-decoration:none;font-weight:500}.names a:hover{text-decoration:underline}
 .names .alias{display:block;color:var(--muted);font-size:12px}
