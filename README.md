@@ -39,6 +39,32 @@ The **Domains** tab maps hostnames to guests: `cloud.example.com` → `10.10.10.
 - **Requirements:** each domain's DNS A record must point to the host's public IP. If the host sits behind a router, the router has to forward TCP 80 and 443 to it.
 - While any domain is enabled, port-forward rules can't take TCP 80 or 443, because those ports belong to nginx. The reverse is enforced too.
 
+### Wildcard certificates (`*.example.com`)
+
+One certificate covers `example.com` and every `*.example.com` subdomain. Let's Encrypt only issues wildcards through a **DNS-01** check, so certbot creates a TXT record through your DNS provider's API. Port 80 doesn't have to be reachable for this.
+
+1. Install the certbot plugin for your provider (they're all Debian packages):
+
+   ```bash
+   apt install python3-certbot-dns-cloudflare
+   ```
+
+2. Go to **Domains → Wildcard certificates → + Add wildcard** and enter the zone (`example.com`), the provider and the API token. It is issued right away (~30 s).
+3. For each domain, choose **HTTPS: Wildcard certificate (DNS)**. The matching certificate is picked automatically, so a new subdomain is on HTTPS immediately.
+
+| Provider | Package | Credentials |
+|---|---|---|
+| Cloudflare | `python3-certbot-dns-cloudflare` | API token with *Zone / DNS / Edit* |
+| DigitalOcean | `python3-certbot-dns-digitalocean` | API token |
+| Linode / Akamai | `python3-certbot-dns-linode` | API token |
+| DNSimple | `python3-certbot-dns-dnsimple` | API token |
+| OVH | `python3-certbot-dns-ovh` | endpoint + application key/secret + consumer key |
+| RFC 2136 (BIND, PowerDNS, Knot) | `python3-certbot-dns-rfc2136` | server, TSIG key name/secret/algorithm |
+
+- **Coverage:** a wildcard covers one level only. `*.example.com` matches `a.example.com` but not `a.b.example.com`; for that you'd add a wildcard for `b.example.com`.
+- **Credentials** are written to `/etc/pve-portfwd/dns/<id>.ini` (mode 0600, directory 0700). They're never returned by the API or included in the debug report. When editing, an empty field keeps the stored value.
+- **Renewal:** certbot's timer renews wildcards through the same DNS plugin. A wildcard that domains still use can't be deleted or disabled.
+
 ## Typical setup
 
 Guests sit on a private bridge (for example `vmbr1`, `10.10.10.0/24`), and the host does NAT for them. Add a rule like:
@@ -56,8 +82,8 @@ Guests sit on a private bridge (for example `vmbr1`, `10.10.10.0/24`), and the h
 pve-portfwd serve           # web UI (what systemd runs)
 pve-portfwd status          # rules, hit counters, hook status
 pve-portfwd test [NAME...]  # reachability test (rule id/name/host port or domain; default: all enabled)
-pve-portfwd domains         # list domains, upstreams and certificate expiry
-pve-portfwd cert DOMAIN     # request / renew a Let's Encrypt certificate now
+pve-portfwd domains         # list domains, wildcard certificates and expiry
+pve-portfwd cert NAME       # request / renew now: a domain, or '*.example.com' for a wildcard
 pve-portfwd debug           # full diagnostic report, paste it when asking for help
 pve-portfwd show            # print the generated iptables-restore payload
 pve-portfwd apply           # re-apply saved rules
@@ -128,7 +154,7 @@ To break the host on purpose, run a scenario. They're also available as buttons 
 | `cert-expiring` | makes every certificate expire in 5 days |
 | `reset` | wipes the simulated iptables |
 
-The simulated guests are 100 web, 101 db, 102 game (stopped), 103 nextcloud, 104 win11 (no guest agent, ignores ping) and 105 office-gw (behind a gateway). The sample rules show every test outcome. The sample domains are `cloud.example.com` (HTTPS working), `app.example.com` (HTTP only, with an alias) and `broken.invalid` (no DNS and nothing listening upstream). The mock certbot fails for names ending in `.invalid` and succeeds after 2 s for everything else. Generated nginx files end up under `.dev/mock-fs/`. Delete `.dev/` to start over.
+The simulated guests are 100 web, 101 db, 102 game (stopped), 103 nextcloud, 104 win11 (no guest agent, ignores ping) and 105 office-gw (behind a gateway). The sample rules show every test outcome. The sample domains are `cloud.example.com` (HTTPS working), `app.example.com` (HTTP only, with an alias) and `broken.invalid` (no DNS and nothing listening upstream). The sample wildcard is `*.example.com` (Cloudflare), used by `status.example.com`. The mock certbot fails for names ending in `.invalid` and succeeds after 2 s for everything else. For wildcards, the API token `bad` gets Cloudflare's "invalid credentials" error, and only the Cloudflare, DigitalOcean and RFC 2136 plugins count as installed, so OVH shows the "plugin missing" message. Generated nginx files end up under `.dev/mock-fs/`. Delete `.dev/` to start over.
 
 `--dry-run` is different. It's meant for a **real** host: read-only commands run for real, and changes are only logged.
 
