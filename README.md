@@ -15,8 +15,8 @@ A small web UI that turns a Proxmox VE host into the gateway for its VMs and con
 | **Ports**: forward host ports to guests, with source/interface filters and live hit counters | **Add domain**: pick a guest, choose Let's Encrypt, a wildcard certificate or plain HTTP |
 | ![Built-in test explains what is wrong](docs/screenshots/domain-test.png) | ![Wildcard certificate via DNS provider API](docs/screenshots/wildcard.png) |
 | **Test**: checks DNS, nginx, the upstream, the certificate and a real request, with how to fix each failure | **Wildcard certificates**: `*.example.com` through your DNS provider's API ([guide](wildcard.md)) |
-| ![Debug tab with health checks](docs/screenshots/debug.png) | ![Works on a phone, light and dark](docs/screenshots/mobile.png) |
-| **Debug**: health checks, raw iptables/nginx/certbot output, log and a downloadable report | **Phone and dark mode** supported |
+| ![Debug tab with health checks](docs/screenshots/debug.png) | |
+| **Debug**: health checks, raw iptables/nginx/certbot output, log and a downloadable report | |
 
 <sub>Screenshots use sample data from the built-in mock mode (`./dev.sh`). Regenerate them with `dev/screenshots.sh`.</sub>
 
