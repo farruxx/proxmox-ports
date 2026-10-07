@@ -1,0 +1,13 @@
+[Unit]
+Description=Port forwarding web UI for Proxmox VE
+After=network-online.target pve-cluster.service pve-firewall.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/pve-portfwd serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
