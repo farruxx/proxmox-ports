@@ -1,7 +1,7 @@
 """
 Simulated Proxmox host for local development (macOS, or anywhere without iptables / root).
 
-Loaded only with `pve-portfwd.py --mock`; never installed on the real host.
+Loaded only with `pve-gateway.py --mock`; never installed on the real host.
 
 Fakes: iptables, iptables-restore, iptables-save, ip, ping, ss, conntrack,
 pve-firewall, pvesh, qm, pct, lxc-info, plus net.ipv4.ip_forward and TCP probes.
@@ -220,7 +220,7 @@ class Mock:
                 for chains in (nat, flt):
                     for c in ("PREROUTING", "POSTROUTING", "FORWARD"):
                         if c in chains:
-                            chains[c] = [r for r in chains[c] if not r.startswith("-j PORTFWD_")]
+                            chains[c] = [r for r in chains[c] if not r.startswith("-j PVEGW_")]
             elif name == "ip-forward-off":
                 st["ip_forward"] = False
             elif name == "forward-drop":
@@ -263,15 +263,15 @@ class Mock:
 
     def _bump(self, st, burst=False):
         """Fake incoming traffic on our DNAT rules (only if they'd really be hit)."""
-        if not self._hooked(st, "nat", "PREROUTING", "PORTFWD_PRE"):
+        if not self._hooked(st, "nat", "PREROUTING", "PVEGW_PRE"):
             return
-        for rule in st["tables"]["nat"]["chains"].get("PORTFWD_PRE", []):
+        for rule in st["tables"]["nat"]["chains"].get("PVEGW_PRE", []):
             to = (_opt(rule, "--to-destination") or "").split(":")[0]
             g = _guest(to)
             if not g or g["status"] != "running" or (not burst and random.random() < 0.5):
                 continue
             pk = random.randint(20, 80) if burst else random.randint(1, 4)
-            c = st["counters"].setdefault("nat|PORTFWD_PRE|" + rule, [0, 0])
+            c = st["counters"].setdefault("nat|PVEGW_PRE|" + rule, [0, 0])
             c[0] += pk
             c[1] += pk * random.randint(52, 1400)
 
@@ -456,10 +456,10 @@ class Mock:
             conf = self._nginx_conf()
             if st.get("nginx_test_fail"):
                 st["nginx_test_fail"] = False
-                return 1, ('nginx: [emerg] unknown directive "proxy_pas" in /etc/nginx/conf.d/pve-portfwd.conf:42\n'
+                return 1, ('nginx: [emerg] unknown directive "proxy_pas" in /etc/nginx/conf.d/pve-gateway.conf:42\n'
                            "nginx: configuration file /etc/nginx/nginx.conf test failed  [mock: nginx-test-fails]"), True
             if conf.count("{") != conf.count("}"):
-                return 1, "nginx: [emerg] unexpected end of file, expecting \"}\" in /etc/nginx/conf.d/pve-portfwd.conf", False
+                return 1, "nginx: [emerg] unexpected end of file, expecting \"}\" in /etc/nginx/conf.d/pve-gateway.conf", False
             for path in re.findall(r"ssl_certificate (\S+);", conf):
                 if self._cert_name(path) not in st["issued"]:
                     return 1, ('nginx: [emerg] cannot load certificate "%s": BIO_new_file() failed\n'
@@ -560,8 +560,8 @@ class Mock:
 
     def c_conntrack(self, st, a, data):
         out = []
-        for rule in st["tables"]["nat"]["chains"].get("PORTFWD_PRE", []):
-            if not st["counters"].get("nat|PORTFWD_PRE|" + rule):
+        for rule in st["tables"]["nat"]["chains"].get("PVEGW_PRE", []):
+            if not st["counters"].get("nat|PVEGW_PRE|" + rule):
                 continue
             proto, dport = _opt(rule, "-p"), (_opt(rule, "--dport") or "0").split(":")[0]
             to = _opt(rule, "--to-destination") or ""

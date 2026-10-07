@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-pve-portfwd - tiny web UI to forward ports from a Proxmox host to its guests.
+pve-gateway - web UI that makes a Proxmox host the gateway for its guests:
+forward ports (iptables DNAT) and route domains (nginx reverse proxy, Let's Encrypt
+and wildcard certificates).
 
-Zero dependencies: Python 3 standard library + iptables (both ship with Proxmox VE).
+Zero dependencies: Python 3 standard library + iptables (both ship with Proxmox VE);
+nginx + certbot only if you use domains.
 
-Rules live in their own iptables chains (PORTFWD_PRE / PORTFWD_POST / PORTFWD_FWD)
+Port rules live in their own iptables chains (PVEGW_PRE / PVEGW_POST / PVEGW_FWD)
 and are swapped atomically with iptables-restore, so nothing else on the host
 (pve-firewall, your own rules) is touched.
 
 Usage:
-  pve-portfwd.py [serve]        run the web UI (default)
-  pve-portfwd.py apply          (re)apply saved rules and exit
-  pve-portfwd.py flush          remove all forwarding rules + chains
-  pve-portfwd.py passwd         set a local password (instead of Proxmox login)
-  pve-portfwd.py --dry-run ...  print iptables commands instead of running them
+  pve-gateway.py [serve]        run the web UI (default)
+  pve-gateway.py apply          (re)apply saved rules and exit
+  pve-gateway.py flush          remove all forwarding rules + chains
+  pve-gateway.py passwd         set a local password (instead of Proxmox login)
+  pve-gateway.py --dry-run ...  print iptables commands instead of running them
+  pve-gateway.py --help         all commands (status, test, debug, domains, cert, ...)
 """
 import argparse
 import base64
@@ -41,8 +45,8 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 VERSION = "1.0.0"
-CONF_DIR = os.environ.get("PORTFWD_DIR", "/etc/pve-portfwd")
-CH_PRE, CH_POST, CH_FWD = "PORTFWD_PRE", "PORTFWD_POST", "PORTFWD_FWD"
+CONF_DIR = os.environ.get("PVE_GATEWAY_DIR") or os.environ.get("PVEGW_DIR") or "/etc/pve-gateway"
+CH_PRE, CH_POST, CH_FWD = "PVEGW_PRE", "PVEGW_POST", "PVEGW_FWD"
 JUMPS = (("nat", "PREROUTING", CH_PRE), ("nat", "POSTROUTING", CH_POST), ("filter", "FORWARD", CH_FWD))
 
 DEFAULTS = {
@@ -65,8 +69,8 @@ DEFAULTS = {
     "domains": [],
     "wildcards": [],  # wildcard certificates via DNS-01 (credentials in <config dir>/dns/<id>.ini)
     "acme_email": "",
-    "nginx_conf": "/etc/nginx/conf.d/pve-portfwd.conf",
-    "acme_webroot": "/var/lib/pve-portfwd/acme",
+    "nginx_conf": "/etc/nginx/conf.d/pve-gateway.conf",
+    "acme_webroot": "/var/lib/pve-gateway/acme",
     "letsencrypt_dir": "/etc/letsencrypt/live",
     "nginx_ipv6": True,  # also listen on [::]:80/443
 }
@@ -99,6 +103,9 @@ def load_config():
             cfg.update(json.load(f))
     except FileNotFoundError:
         pass
+    for k in ("nginx_conf", "acme_webroot"):  # paths saved before the rename from pve-portfwd
+        if isinstance(cfg.get(k), str) and "pve-portfwd" in cfg[k]:
+            cfg[k] = cfg[k].replace("pve-portfwd", "pve-gateway")
     rules = []
     for r in cfg.get("rules", []):
         try:
@@ -140,7 +147,7 @@ def log(msg, level="info"):
     if level == "debug" and not VERBOSE:
         return
     LOGS.append("%s %-5s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), level.upper(), msg))
-    sys.stderr.write("[pve-portfwd] %s%s\n" % ("" if level == "info" else level.upper() + ": ", msg))
+    sys.stderr.write("[pve-gateway] %s%s\n" % ("" if level == "info" else level.upper() + ": ", msg))
     sys.stderr.flush()
 
 
@@ -289,7 +296,7 @@ def build_ruleset(cfg):
         dport = str(ea) if ea == eb else "%d:%d" % (ea, eb)
         to = "%s:%s" % (r["ip"], r["int_port"]) if r["int_port"] else r["ip"]
         iport = r["int_port"] or dport
-        cm = '-m comment --comment "pf:%s"' % r["id"]
+        cm = '-m comment --comment "gw:%s"' % r["id"]
         for p in protos(r["proto"]):
             pre = "-A %s -p %s" % (CH_PRE, p)
             if r["iface"]:
@@ -370,7 +377,7 @@ def counters():
     if rc != 0:
         return res
     for line in out.splitlines():
-        m = re.match(r"^\[(\d+):(\d+)\] -A %s .*pf:([0-9a-f]+)" % CH_PRE, line)
+        m = re.match(r"^\[(\d+):(\d+)\] -A %s .*gw:([0-9a-f]+)" % CH_PRE, line)
         if m:
             c = res.setdefault(m.group(3), [0, 0])
             c[0] += int(m.group(1))
@@ -667,7 +674,7 @@ def write_creds(w, vals):
     tmp = cred_path(w) + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
-        f.write("# pve-portfwd: certbot %s credentials for %s\n" % (w["provider"], w["zone"]))
+        f.write("# pve-gateway: certbot %s credentials for %s\n" % (w["provider"], w["zone"]))
         f.writelines("%s = %s\n" % kv for kv in vals.items())
     os.replace(tmp, cred_path(w))
 
@@ -710,7 +717,7 @@ def nginx_proxy_block(d):
         "        proxy_set_header X-Forwarded-Proto $scheme;",
         "        proxy_set_header X-Forwarded-Host $host;",
         "        proxy_set_header Upgrade $http_upgrade;",
-        "        proxy_set_header Connection $pf_connection_upgrade;",
+        "        proxy_set_header Connection $pvegw_connection_upgrade;",
         "        proxy_read_timeout 1h;",
         "        proxy_send_timeout 1h;",
     ]
@@ -720,9 +727,9 @@ def nginx_proxy_block(d):
 
 
 def build_nginx(cfg):
-    out = ["# Generated by pve-portfwd %s - do not edit, changes are overwritten." % VERSION,
-           "# Manage domains in the pve-portfwd web UI.", "",
-           "map $http_upgrade $pf_connection_upgrade {", "    default upgrade;", "    ''      close;", "}"]
+    out = ["# Generated by pve-gateway %s - do not edit, changes are overwritten." % VERSION,
+           "# Manage domains in the pve-gateway web UI.", "",
+           "map $http_upgrade $pvegw_connection_upgrade {", "    default upgrade;", "    ''      close;", "}"]
     v6 = cfg.get("nginx_ipv6", True)
     acme = ["    location ^~ /.well-known/acme-challenge/ {", "        root %s;" % cfg["acme_webroot"],
             "        default_type text/plain;", "    }"]
@@ -747,7 +754,7 @@ def build_nginx(cfg):
                 "    ssl_certificate %s;" % crt,
                 "    ssl_certificate_key %s;" % key,
                 "    ssl_protocols TLSv1.2 TLSv1.3;",
-                "    ssl_session_cache shared:pf_ssl:10m;",
+                "    ssl_session_cache shared:pvegw_ssl:10m;",
                 "    ssl_session_timeout 1d;"] + nginx_proxy_block(d) + ["}"]
     return "\n".join(out) + "\n"
 
@@ -915,7 +922,7 @@ def http_check(host, tls):
             conn = http.client.HTTPSConnection("127.0.0.1", 443, timeout=8, context=ssl._create_unverified_context())
         else:
             conn = http.client.HTTPConnection("127.0.0.1", 80, timeout=8)
-        conn.request("GET", "/", headers={"Host": host, "User-Agent": "pve-portfwd-test"})
+        conn.request("GET", "/", headers={"Host": host, "User-Agent": "pve-gateway-test"})
         r = conn.getresponse()
         return r.status, "%d %s%s" % (r.status, r.reason, (" -> " + r.getheader("Location")) if r.getheader("Location") else "")
     except (OSError, http.client.HTTPException) as e:
@@ -1006,7 +1013,7 @@ def loaded_rule_ids():
     rc, out = sh(["iptables-save", "-t", "nat"])
     ids = {}
     if rc == 0:
-        for m in re.finditer(r"^-A %s .*pf:([0-9a-f]+)" % CH_PRE, out, re.M):
+        for m in re.finditer(r"^-A %s .*gw:([0-9a-f]+)" % CH_PRE, out, re.M):
             ids[m.group(1)] = ids.get(m.group(1), 0) + 1
     return ids
 
@@ -1127,7 +1134,7 @@ def sections():
 
     def ours(table):
         rc, out = sh(["iptables-save", "-c", "-t", table])
-        return "\n".join(line for line in out.splitlines() if "PORTFWD" in line) or "(none loaded)" if rc == 0 else out
+        return "\n".join(line for line in out.splitlines() if "PVEGW" in line) or "(none loaded)" if rc == 0 else out
 
     safe_cfg = dict(cfg, pass_hash="***" if cfg.get("pass_hash") else "")
     return [
@@ -1171,7 +1178,7 @@ def fmt_steps(steps):
 
 
 def report_text(d):
-    out = ["pve-portfwd %s debug report | host %s | %s%s" % (
+    out = ["pve-gateway %s debug report | host %s | %s%s" % (
         d["version"], d["host"], d["generated"], " | DRY RUN" if d["dry_run"] else " | MOCK" if d["mock"] else ""),
         "", fmt_steps(d["checks"])]
     for s in d["sections"][1:] + d["sections"][:1]:  # log last
@@ -1299,7 +1306,7 @@ def authenticate(user, pw):
 # --------------------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "pve-portfwd/" + VERSION
+    server_version = "pve-gateway/" + VERSION
     sys_version = ""
     timeout = 30
 
@@ -1339,7 +1346,7 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def session_user(self):
-        tok = self.cookie("pfsid")
+        tok = self.cookie("pvegw_sid")
         s = SESSIONS.get(tok) if tok else None
         if s and s[1] > time.time():
             s[1] = time.time() + SESSION_TTL
@@ -1367,8 +1374,8 @@ class Handler(BaseHTTPRequestHandler):
             if not path.startswith("/api/"):
                 return self.send(404, {"error": "not found"})
             # custom header can't be sent cross-site without CORS preflight -> CSRF protection
-            if method != "GET" and self.headers.get("X-PF") != "1":
-                return self.send(403, {"error": "missing X-PF header"})
+            if method != "GET" and self.headers.get("X-PVEGW") != "1":
+                return self.send(403, {"error": "missing X-PVEGW header"})
             if path == "/api/login" and method == "POST":
                 return self.login()
             if path == "/api/authinfo" and method == "GET":
@@ -1407,13 +1414,13 @@ class Handler(BaseHTTPRequestHandler):
         tok = secrets.token_urlsafe(32)
         SESSIONS[tok] = [user, now + SESSION_TTL]
         secure = "; Secure" if self.server.tls else ""
-        self.send(200, {"user": user}, cookies=["pfsid=%s; Path=/; HttpOnly; SameSite=Strict%s" % (tok, secure)])
+        self.send(200, {"user": user}, cookies=["pvegw_sid=%s; Path=/; HttpOnly; SameSite=Strict%s" % (tok, secure)])
 
     def api(self, method, path, user):
         cfg = STATE["cfg"]
         if path == "/api/logout" and method == "POST":
-            SESSIONS.pop(self.cookie("pfsid"), None)
-            return self.send(200, {"ok": True}, cookies=["pfsid=; Path=/; Max-Age=0"])
+            SESSIONS.pop(self.cookie("pvegw_sid"), None)
+            return self.send(200, {"ok": True}, cookies=["pvegw_sid=; Path=/; Max-Age=0"])
         if path == "/api/state" and method == "GET":
             return self.send(200, {
                 "user": user, "version": VERSION, "rules": cfg["rules"], "counters": counters(),
@@ -1667,11 +1674,11 @@ def serve(cfg):
 INDEX_HTML = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Port Forwarding</title><link rel="stylesheet" href="/app.css">
+<title>PVE Gateway</title><link rel="stylesheet" href="/app.css">
 </head><body>
 <div id="login" class="center" hidden>
   <form id="loginForm" class="card login">
-    <h1>Port Forwarding</h1>
+    <h1>PVE Gateway</h1>
     <p class="muted" id="loginHint">Sign in with your Proxmox account</p>
     <label>User<input name="username" autocomplete="username" value="root@pam" required></label>
     <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
@@ -1681,7 +1688,7 @@ INDEX_HTML = r"""<!doctype html>
 </div>
 <div id="app" hidden>
   <header>
-    <h1>Port Forwarding</h1>
+    <h1>PVE Gateway</h1>
     <nav class="tabs"><a href="#rules" data-view="rules">Ports</a><a href="#domains" data-view="domains">Domains</a><a href="#debug" data-view="debug">Debug</a></nav>
     <div id="status" class="chips"></div>
     <span class="spacer"></span>
@@ -1702,7 +1709,7 @@ INDEX_HTML = r"""<!doctype html>
       <p id="empty" class="muted pad" hidden>No forwarding rules yet. Click <b>+ Add rule</b>.</p>
     </div>
     <p class="muted small">Only traffic addressed to this host is forwarded. Rules are kept in iptables chains
-      <code>PORTFWD_*</code> and restored automatically when the service starts.</p>
+      <code>PVEGW_*</code> and restored automatically when the service starts.</p>
   </main>
   <main id="view-domains" hidden>
     <div class="bar">
@@ -1727,7 +1734,7 @@ INDEX_HTML = r"""<!doctype html>
         DNS provider's API. It doesn't need port 80, and new subdomains get HTTPS instantly: pick <i>Wildcard</i> as the domain's HTTPS option.</p>
     </div>
     <p class="muted small">nginx on this host answers on ports 80/443 and proxies each domain to a guest
-      (<code>/etc/nginx/conf.d/pve-portfwd.conf</code>). With Let's Encrypt, certbot gets and renews certificates automatically.
+      (<code>/etc/nginx/conf.d/pve-gateway.conf</code>). With Let's Encrypt, certbot gets and renews certificates automatically.
       DNS must point at this host's public IP, and if the host is behind a router, the router must forward ports 80 and 443 to it.</p>
   </main>
   <main id="view-debug" hidden>
@@ -1744,8 +1751,8 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     <div class="card"><ul id="checks" class="checks"></ul></div>
     <div id="sections"></div>
-    <p class="muted small">CLI on the host: <code>pve-portfwd status</code>, <code>pve-portfwd test [rule]</code>,
-      <code>pve-portfwd debug</code>, <code>pve-portfwd -v serve</code>, <code>journalctl -u pve-portfwd -f</code></p>
+    <p class="muted small">CLI on the host: <code>pve-gateway status</code>, <code>pve-gateway test [rule]</code>,
+      <code>pve-gateway debug</code>, <code>pve-gateway -v serve</code>, <code>journalctl -u pve-gateway -f</code></p>
   </main>
 </div>
 
@@ -1893,6 +1900,7 @@ font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre}
 .sub-head{display:flex;align-items:center;gap:10px;margin:22px 0 10px}.sub-head h2{margin:0;font-size:15px}
 .sub-head button{padding:4px 12px;font-size:13px}
 .hint{margin:-4px 0 0;font-size:12px;color:var(--muted)}.hint.bad{color:var(--bad)}
+form > .hint{margin:12px 0 0}
 #wcFields:empty{display:none}
 .names a{color:var(--fg);text-decoration:none;font-weight:500}.names a:hover{text-decoration:underline}
 .names .alias{display:block;color:var(--muted);font-size:12px}
@@ -1908,7 +1916,7 @@ let S = {rules: [], counters: {}, ifaces: []}, guests = null, editing = null, ti
 
 async function api(method, path, body) {
   const r = await fetch(path, {method, credentials: 'same-origin',
-    headers: {'Content-Type': 'application/json', 'X-PF': '1'},
+    headers: {'Content-Type': 'application/json', 'X-PVEGW': '1'},
     body: body === undefined ? undefined : JSON.stringify(body)});
   const j = await r.json().catch(() => ({}));
   if (r.status === 401 && path !== '/api/login') { showLogin(); throw new Error('Login required'); }
@@ -1945,7 +1953,7 @@ function showLogin() {
   fetch('/api/authinfo').then(r => r.json()).then(a => {
     $('#loginForm').username.value = a.user;
     $('#loginHint').textContent = a.mock ? 'Mock mode (simulated host): admin / admin'
-      : a.mode === 'local' ? 'Sign in with the local pve-portfwd account' : 'Sign in with your Proxmox account';
+      : a.mode === 'local' ? 'Sign in with the local pve-gateway account' : 'Sign in with your Proxmox account';
   }).catch(() => {});
 }
 
@@ -2337,7 +2345,7 @@ $('#dbgCopy').onclick = async () => {
 $('#dbgDownload').onclick = async () => {
   try {
     const url = URL.createObjectURL(new Blob([await reportText()], {type: 'text/plain'}));
-    const a = el('a', {href: url, download: 'pve-portfwd-debug-' + new Date().toISOString().slice(0, 19).replace(/:/g, '') + '.txt'});
+    const a = el('a', {href: url, download: 'pve-gateway-debug-' + new Date().toISOString().slice(0, 19).replace(/:/g, '') + '.txt'});
     document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch (e) { $('#dbgMsg').textContent = e.message; }
 };
@@ -2373,7 +2381,7 @@ def start_mock(here):
     path = os.path.join(here, "dev", "mock.py")
     if not os.path.exists(path):
         sys.exit("--mock needs %s (it is only in the source tree, not installed on hosts)" % path)
-    spec = importlib.util.spec_from_file_location("pve_portfwd_mock", path)
+    spec = importlib.util.spec_from_file_location("pve_gateway_mock", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     MOCK = mod.Mock(CONF_DIR, socket.gethostname().split(".")[0])
@@ -2382,7 +2390,7 @@ def start_mock(here):
 def main():
     global DRY_RUN, CONF_DIR, VERBOSE
     ap = argparse.ArgumentParser(
-        description="Port forwarding web UI for Proxmox VE",
+        description="pve-gateway: port forwarding and domains for Proxmox VE guests",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""commands:
   serve            run the web UI (default)
@@ -2398,7 +2406,7 @@ def main():
   mock SCENARIO    (--mock only) break the simulated host: %s
 
 local development (macOS etc.):
-  ./pve-portfwd.py --mock         simulated Proxmox host, http://127.0.0.1:8099, login admin / admin""" % (
+  ./pve-gateway.py --mock         simulated Proxmox host, http://127.0.0.1:8099, login admin / admin""" % (
             "reset, unhook, ip-forward-off, forward-drop, pvefw-first, foreign-dnat, traffic"))
     ap.add_argument("cmd", nargs="?", default="serve",
                     choices=["serve", "status", "test", "debug", "show", "apply", "flush", "passwd", "mock",
@@ -2491,7 +2499,7 @@ local development (macOS etc.):
     elif a.cmd == "status":
         cnt = counters()
         print("hooks: %s   ip_forward: %s   rules: %d (%d enabled)%s" % (
-            "active" if DRY_RUN or hooks_active() else "MISSING (run: pve-portfwd apply)",
+            "active" if DRY_RUN or hooks_active() else "MISSING (run: pve-gateway apply)",
             "on" if ip_forward_on() else "OFF", len(cfg["rules"]), sum(r["enabled"] for r in cfg["rules"]),
             "   [dry-run]" if DRY_RUN else "   [mock]" if MOCK else ""))
         if cfg["rules"]:
@@ -2541,7 +2549,7 @@ local development (macOS etc.):
             sys.exit("passwords do not match")
         cfg["local_user"], cfg["pass_hash"] = user, hash_password(pw) if pw else ""
         save_config(cfg)
-        print("saved; restart the service: systemctl restart pve-portfwd")
+        print("saved; restart the service: systemctl restart pve-gateway")
     else:
         serve(cfg)
 

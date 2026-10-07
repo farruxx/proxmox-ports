@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/local/bin/pve-portfwd serve
+ExecStart=/usr/bin/python3 /usr/local/bin/pve-gateway serve
 Restart=on-failure
 RestartSec=3
 

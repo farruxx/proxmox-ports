@@ -1,11 +1,31 @@
-# pve-portfwd
+# pve-gateway
 
-A small web UI that runs on a Proxmox VE host and forwards ports from the host to VMs and containers.
+A small web UI that turns a Proxmox VE host into the gateway for its VMs and containers:
+
+- **Ports:** forward host ports to guests (iptables DNAT).
+- **Domains:** route `app.example.com` → guest `ip:port` through nginx, with automatic Let's Encrypt and wildcard (`*.example.com`) certificates.
+
+![Domains: reverse proxy with Let's Encrypt and wildcard certificates](docs/screenshots/domains.png)
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Port forwarding rules with live hit counters](docs/screenshots/ports.png) | ![Add a domain: pick a guest, choose HTTPS](docs/screenshots/add-domain.png) |
+| **Ports**: forward host ports to guests, with source/interface filters and live hit counters | **Add domain**: pick a guest, choose Let's Encrypt, a wildcard certificate or plain HTTP |
+| ![Built-in test explains what is wrong](docs/screenshots/domain-test.png) | ![Wildcard certificate via DNS provider API](docs/screenshots/wildcard.png) |
+| **Test**: checks DNS, nginx, the upstream, the certificate and a real request, with how to fix each failure | **Wildcard certificates**: `*.example.com` through your DNS provider's API ([guide](wildcard.md)) |
+| ![Debug tab with health checks](docs/screenshots/debug.png) | ![Works on a phone, light and dark](docs/screenshots/mobile.png) |
+| **Debug**: health checks, raw iptables/nginx/certbot output, log and a downloadable report | **Phone and dark mode** supported |
+
+<sub>Screenshots use sample data from the built-in mock mode (`./dev.sh`). Regenerate them with `dev/screenshots.sh`.</sub>
+
+> Upgrading from **pve-portfwd** (the old name)? Run `sh install.sh` as usual. It migrates the config, DNS credentials, ACME webroot and certbot renewal settings, and removes the old service and iptables chains.
 
 - **No dependencies.** It's one Python 3 file using only the standard library, and it drives `iptables`. Both already ship with Proxmox VE 7 and 8.
 - **Login with your Proxmox account.** Credentials are checked against the local PVE API, and only `root@pam` is allowed by default. You can switch to a local password instead.
 - **HTTPS out of the box.** It reuses the Proxmox certificate (`/etc/pve/local/pveproxy-ssl.*` or `pve-ssl.*`).
-- **Safe to run next to other rules.** Everything lives in its own chains (`PORTFWD_PRE`, `PORTFWD_POST`, `PORTFWD_FWD`), which are swapped atomically with `iptables-restore`. pve-firewall and your own rules are left alone.
+- **Safe to run next to other rules.** Everything lives in its own chains (`PVEGW_PRE`, `PVEGW_POST`, `PVEGW_FWD`), which are swapped atomically with `iptables-restore`. pve-firewall and your own rules are left alone.
 - **Guest picker.** It lists local VMs and CTs with their IPs (from the QEMU guest agent or the LXC config).
 - Supports TCP, UDP or both, port ranges, a source IP/CIDR allow-list, an incoming interface, optional masquerade, and shows per-rule hit counters.
 - **Guard rails.** It refuses to forward 22, 8006, 3128, 111, 5405-5412 or its own port. Only traffic **addressed to the host** is forwarded (`-m addrtype --dst-type LOCAL`), so guests' outgoing traffic is never hijacked.
@@ -14,11 +34,11 @@ A small web UI that runs on a Proxmox VE host and forwards ports from the host t
 ## Install (on the Proxmox host, as root)
 
 ```bash
-scp pve-portfwd.py pve-portfwd.service install.sh root@pve:/root/pve-portfwd/
+scp pve-gateway.py pve-gateway.service install.sh root@pve:/root/pve-gateway/
 ```
 
 ```bash
-cd /root/pve-portfwd && sh install.sh
+cd /root/pve-gateway && sh install.sh
 ```
 
 Then open `https://<proxmox-ip>:8099` and log in as `root@pam`.
@@ -33,7 +53,7 @@ sh install.sh --with-nginx
 
 The **Domains** tab maps hostnames to guests: `cloud.example.com` → `10.10.10.13:80`, `git.example.com` → `https://10.10.10.10:443`, and so on. nginx on the host answers on ports 80 and 443 and proxies each request by its `Host` header, so many guests can share one public IP and the same ports.
 
-- Everything goes into a single generated file, `/etc/nginx/conf.d/pve-portfwd.conf`. Other nginx sites are left alone. Each change is checked with `nginx -t` before reload; if the check fails, the previous file is restored and the error is shown in the UI.
+- Everything goes into a single generated file, `/etc/nginx/conf.d/pve-gateway.conf`. Other nginx sites are left alone. Each change is checked with `nginx -t` before reload; if the check fails, the previous file is restored and the error is shown in the UI.
 - **Let's Encrypt** (optional, per domain) uses `certbot certonly --webroot`. The certificate is requested in the background right after saving, and certbot's own systemd timer renews it, reloading nginx through a deploy hook. *Cert* re-requests it on demand, and *Test* checks DNS, nginx, the upstream, the certificate and a real request through nginx.
 - **Per domain options:** aliases (extra hostnames), an HTTPS upstream (self-signed certificates are accepted), redirect HTTP to HTTPS, max upload size, and allowed source IPs/CIDRs. WebSockets always work.
 - **Requirements:** each domain's DNS A record must point to the host's public IP. If the host sits behind a router, the router has to forward TCP 80 and 443 to it.
@@ -64,7 +84,7 @@ One certificate covers `example.com` and every `*.example.com` subdomain. Let's 
 | RFC 2136 (BIND, PowerDNS, Knot) | `python3-certbot-dns-rfc2136` | server, TSIG key name/secret/algorithm |
 
 - **Coverage:** a wildcard covers one level only. `*.example.com` matches `a.example.com` but not `a.b.example.com`; for that you'd add a wildcard for `b.example.com`.
-- **Credentials** are written to `/etc/pve-portfwd/dns/<id>.ini` (mode 0600, directory 0700). They're never returned by the API or included in the debug report. When editing, an empty field keeps the stored value.
+- **Credentials** are written to `/etc/pve-gateway/dns/<id>.ini` (mode 0600, directory 0700). They're never returned by the API or included in the debug report. When editing, an empty field keeps the stored value.
 - **Renewal:** certbot's timer renews wildcards through the same DNS plugin. A wildcard that domains still use can't be deleted or disabled.
 
 ## Typical setup
@@ -81,29 +101,29 @@ Guests sit on a private bridge (for example `vmbr1`, `10.10.10.0/24`), and the h
 ## CLI
 
 ```
-pve-portfwd serve           # web UI (what systemd runs)
-pve-portfwd status          # rules, hit counters, hook status
-pve-portfwd test [NAME...]  # reachability test (rule id/name/host port or domain; default: all enabled)
-pve-portfwd domains         # list domains, wildcard certificates and expiry
-pve-portfwd cert NAME       # request / renew now: a domain, or '*.example.com' for a wildcard
-pve-portfwd debug           # full diagnostic report, paste it when asking for help
-pve-portfwd show            # print the generated iptables-restore payload
-pve-portfwd apply           # re-apply saved rules
-pve-portfwd flush           # remove all forwarding rules/chains (config kept)
-pve-portfwd passwd          # use a local user/password instead of Proxmox login
-pve-portfwd -v ...          # verbose: log every iptables command and HTTP request
-pve-portfwd --dry-run ...   # log iptables commands instead of running them (for testing)
+pve-gateway serve           # web UI (what systemd runs)
+pve-gateway status          # rules, hit counters, hook status
+pve-gateway test [NAME...]  # reachability test (rule id/name/host port or domain; default: all enabled)
+pve-gateway domains         # list domains, wildcard certificates and expiry
+pve-gateway cert NAME       # request / renew now: a domain, or '*.example.com' for a wildcard
+pve-gateway debug           # full diagnostic report, paste it when asking for help
+pve-gateway show            # print the generated iptables-restore payload
+pve-gateway apply           # re-apply saved rules
+pve-gateway flush           # remove all forwarding rules/chains (config kept)
+pve-gateway passwd          # use a local user/password instead of Proxmox login
+pve-gateway -v ...          # verbose: log every iptables command and HTTP request
+pve-gateway --dry-run ...   # log iptables commands instead of running them (for testing)
 ```
 
 ## Debugging
 
 **Debug tab** in the web UI:
 - **Health checks:** root, iptables, `ip_forward`, whether each hook exists and where it sits in its chain, whether the kernel rules match the config, FORWARD policy, pve-firewall status, and host services listening on a forwarded port.
-- **Raw output:** the generated ruleset, the loaded `PORTFWD_*` rules with packet/byte counters, the full PREROUTING/POSTROUTING/FORWARD chains, tracked connections to the guests, interfaces, routes, listening sockets, and the config (password hash hidden).
+- **Raw output:** the generated ruleset, the loaded `PVEGW_*` rules with packet/byte counters, the full PREROUTING/POSTROUTING/FORWARD chains, tracked connections to the guests, interfaces, routes, listening sockets, and the config (password hash hidden).
 - **Service log:** the last 500 lines kept in memory, plus a *Verbose logging* switch that takes effect immediately without a restart.
-- **Copy report / Download report:** gives you the same text as `pve-portfwd debug`.
+- **Copy report / Download report:** gives you the same text as `pve-gateway debug`.
 
-**Test** button on each rule (or `pve-portfwd test`): runs from the host and checks:
+**Test** button on each rule (or `pve-gateway test`): runs from the host and checks:
 - the rule is loaded
 - `ip_forward` is on
 - the route to the guest (and whether it goes through a gateway)
@@ -113,7 +133,7 @@ pve-portfwd --dry-run ...   # log iptables commands instead of running them (for
 
 The tests check the guest side only. If the counter stays at 0 while you test from outside, traffic never reaches the host, so check your router, ISP or cloud firewall.
 
-Service logs: `journalctl -u pve-portfwd -f`. To keep verbose logging on permanently, change `ExecStart` in the unit to `... pve-portfwd -v serve`.
+Service logs: `journalctl -u pve-gateway -f`. To keep verbose logging on permanently, change `ExecStart` in the unit to `... pve-gateway -v serve`.
 
 ## Local development (macOS)
 
@@ -160,7 +180,7 @@ The simulated guests are 100 web, 101 db, 102 game (stopped), 103 nextcloud, 104
 
 `--dry-run` is different. It's meant for a **real** host: read-only commands run for real, and changes are only logged.
 
-## Config: `/etc/pve-portfwd/config.json`
+## Config: `/etc/pve-gateway/config.json`
 
 Rules are stored here too. Restart the service after editing it by hand.
 
@@ -180,7 +200,7 @@ Rules are stored here too. Restart the service after editing it by hand.
 
 ## Trusted HTTPS (Let's Encrypt)
 
-Out of the box Proxmox uses a self-signed certificate, so browsers show a warning on both `:8006` and `:8099`. Give Proxmox a real certificate and pve-portfwd uses it too. Renewals are picked up within 5 minutes, with no restart needed.
+Out of the box Proxmox uses a self-signed certificate, so browsers show a warning on both `:8006` and `:8099`. Give Proxmox a real certificate and pve-gateway uses it too. Renewals are picked up within 5 minutes, with no restart needed.
 
 Here's an example for a domain on Cloudflare DNS. It uses a DNS-01 challenge, so port 80 doesn't need to be open. Create a Cloudflare API token with *Zone → DNS → Edit* for the zone, then run on the host:
 

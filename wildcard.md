@@ -1,10 +1,10 @@
 # Wildcard certificates (`*.example.com`)
 
-A wildcard certificate covers a zone and every subdomain directly below it, such as `example.com`, `cloud.example.com` and `git.example.com`. After you issue it once, any new subdomain you add in pve-portfwd is on HTTPS immediately, with no per-domain certificate request.
+A wildcard certificate covers a zone and every subdomain directly below it, such as `example.com`, `cloud.example.com` and `git.example.com`. After you issue it once, any new subdomain you add in pve-gateway is on HTTPS immediately, with no per-domain certificate request.
 
 ## How it works
 
-Let's Encrypt only issues wildcard certificates through the **DNS-01** challenge. certbot proves you control the domain by creating a temporary `_acme-challenge` TXT record through your DNS provider's API, which is why pve-portfwd needs an API token for your DNS provider.
+Let's Encrypt only issues wildcard certificates through the **DNS-01** challenge. certbot proves you control the domain by creating a temporary `_acme-challenge` TXT record through your DNS provider's API, which is why pve-gateway needs an API token for your DNS provider.
 
 - Port 80 doesn't need to be reachable from the internet to *issue* the certificate. Visitors still reach your sites on port 443, though.
 - One certificate covers **two names**: `example.com` and `*.example.com`.
@@ -79,7 +79,7 @@ Use an **API token**, not the Global API Key.
 | OVH | Keys from https://api.ovh.com/createToken/ with `GET/POST/PUT/DELETE` on `/domain/zone/*`; endpoint usually `ovh-eu` |
 | RFC 2136 | A TSIG key allowed to update the zone; enter the server IP, key name, secret and algorithm (default `HMAC-SHA512`) |
 
-## 4. Add the wildcard in pve-portfwd
+## 4. Add the wildcard in pve-gateway
 
 1. Open the web UI → **Domains** tab → **Wildcard certificates → + Add wildcard**.
 2. Fill in the form:
@@ -95,7 +95,7 @@ The certificate is requested in the background and usually takes 30–60 seconds
 To use the CLI instead:
 
 ```bash
-pve-portfwd cert '*.example.com'
+pve-gateway cert '*.example.com'
 ```
 
 ## 5. Use it for your domains
@@ -120,7 +120,7 @@ certbot renew --dry-run --cert-name wildcard.example.com
 To check expiry dates:
 
 ```bash
-pve-portfwd domains
+pve-gateway domains
 ```
 
 The **Debug** tab warns when a certificate has fewer than 14 days left.
@@ -129,13 +129,13 @@ The **Debug** tab warns when a certificate has fewer than 14 days left.
 
 | What | Where |
 |---|---|
-| DNS credentials | `/etc/pve-portfwd/dns/<id>.ini` (mode 0600, folder 0700) |
+| DNS credentials | `/etc/pve-gateway/dns/<id>.ini` (mode 0600, folder 0700) |
 | Certificate | `/etc/letsencrypt/live/wildcard.example.com/` |
-| nginx config | `/etc/nginx/conf.d/pve-portfwd.conf` |
+| nginx config | `/etc/nginx/conf.d/pve-gateway.conf` |
 
 - **Credentials** are never shown again in the UI, the API or the debug report. When editing a wildcard, leave a credential field empty to keep the stored value. Deleting the wildcard deletes its credentials file.
 - **Keep the credentials file in place:** certbot needs it for every renewal.
-- **Certificate files** are kept even if you delete the wildcard in pve-portfwd.
+- **Certificate files** are kept even if you delete the wildcard in pve-gateway.
 - **Rules:**
   - You can't delete or disable a wildcard while domains still use it. Switch those domains to another HTTPS option first.
   - The zone can't be changed after creation. Add a new wildcard instead.
